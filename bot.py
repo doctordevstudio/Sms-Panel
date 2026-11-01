@@ -460,7 +460,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_history_page(update, context, 0)
     
     elif text == "🎧 Customer Support":
-        await update.message.reply_text("👨‍💻 For support, please contact: <b>@dekhohatkebot</b>", parse_mode="HTML")
+        await update.message.reply_text("👨‍💻 For support, please contact: <b>@dekhohatkesupportbot</b>", parse_mode="HTML")
 
 async def show_history_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
     full_hist = context.user_data.get('full_history', [])
