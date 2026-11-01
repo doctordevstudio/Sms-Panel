@@ -344,7 +344,7 @@ def get_main_menu(project_name):
 # --- Public UI Flow ---
 async def check_joined_channel(user_id, context):
     try:
-        member = await context.bot.get_chat_member("@smsdehksk", user_id)
+        member = await context.bot.get_chat_member("@SMSPANNELS", user_id)
         return member.status in ['member', 'administrator', 'creator']
     except:
         return False
@@ -359,7 +359,7 @@ async def show_public_welcome(update, context, edit=False):
             usage = resp.get("usage", {})
             rem = usage.get("remaining", "Unlimited")
             text = (
-                "🌟 <b>Welcome to Rishav's SMS Service!</b> 🌟\n\n"
+                "🌟 <b>Welcome to SMS Service!</b> 🌟\n\n"
                 "✨ <b>Available Services:</b>\n"
                 "1️⃣ <b>Get OTP:</b> 2 Credits per OTP\n"
                 "2️⃣ <b>Specific Number:</b> 10 Credits (Get 5 latest SMS)\n"
@@ -381,7 +381,7 @@ async def show_public_welcome(update, context, edit=False):
             return
     
     text = (
-        "🌟 <b>Welcome to Rishav's SMS Service!</b> 🌟\n\n"
+        "🌟 <b>Welcome to SMS Service!</b> 🌟\n\n"
         "To access our premium features (OTP, Specific Number tracking, Custom SMS sender), "
         "you need a valid License Key.\n\n"
         "🛒 <i>Purchase your key from @dekhohatkebot</i>"
@@ -406,7 +406,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_projects_menu(update, context)
     else:
         if not await check_joined_channel(user.id, context):
-            kb = [[InlineKeyboardButton("📢 Join Channel", url="https://t.me/smsdehksk")],
+            kb = [[InlineKeyboardButton("📢 Join Channel", url="https://t.me/SMSPANNELS")],
                   [InlineKeyboardButton("✅ Verify", callback_data="verify_join")]]
             await update.message.reply_text("👋 <b>Welcome!</b>\nPlease join our official channel to continue.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
             return
@@ -420,7 +420,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Check channel again
     if not await check_joined_channel(user.id, context):
-        await update.message.reply_text("Please join @smsdehksk first.")
+        await update.message.reply_text("Please join @SMSPANNELS first.")
         return
 
     license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
@@ -1006,7 +1006,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Allow verify_join for all
     if data == "verify_join":
         if await check_joined_channel(user.id, context): await show_public_welcome(update, context, edit=True)
-        else: await query.edit_message_text("❌ You have not joined the channel yet.\nPlease join and try again.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join", url="https://t.me/smsdehksk"), InlineKeyboardButton("✅ Verify", callback_data="verify_join")]]))
+        else: await query.edit_message_text("❌ You have not joined the channel yet.\nPlease join and try again.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join", url="https://t.me/SMSPANNELS"), InlineKeyboardButton("✅ Verify", callback_data="verify_join")]]))
         return
         
     # Block unauthorized access paths unless it's public features
