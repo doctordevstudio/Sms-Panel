@@ -151,6 +151,14 @@ async def log_public_history(user_id, action, details):
     await put_json(f"{MY_DB_URL}/users_history/{user_id}/{now}", payload)
 
 # --- Dekhohatke API Helpers ---
+def get_remaining_credits(resp):
+    if not isinstance(resp, dict): return 0
+    if "usage" in resp:
+        return resp["usage"].get("remaining", 0)
+    if "license" in resp and "limit" in resp["license"]:
+        return resp["license"]["limit"].get("remaining", 0)
+    return 0
+
 async def call_dekhohatke(endpoint, payload):
     url = f"https://api.dekhohatke.com/api/v1/{DEKHOHATKE_APP_ID}/{endpoint}"
     headers = {"X-API-Key": DEKHOHATKE_API_KEY, "Content-Type": "application/json"}
@@ -165,8 +173,11 @@ async def call_dekhohatke(endpoint, payload):
 async def verify_dekhohatke_license(key, device_id):
     return await call_dekhohatke("verify", {"license_key": key, "device_id": str(device_id)})
 
-async def consume_dekhohatke_credit(key, device_id, units):
-    return await call_dekhohatke("consume", {"license_key": key, "device_id": str(device_id), "units": units})
+async def consume_dekhohatke_credit(key, device_id, units, request_id=None):
+    payload = {"license_key": key, "device_id": str(device_id), "units": units}
+    if request_id:
+        payload["request_id"] = request_id
+    return await call_dekhohatke("consume", payload)
 
 
 # --- Data Normalization ---
@@ -356,15 +367,14 @@ async def show_public_welcome(update, context, edit=False):
     if license_data and license_data.get("key"):
         resp, status = await verify_dekhohatke_license(license_data["key"], user.id)
         if resp.get("success"):
-            usage = resp.get("usage", {})
-            rem = usage.get("remaining", "Unlimited")
+            rem = get_remaining_credits(resp)
             text = (
                 "🌟 <b>Welcome to SMS Service!</b> 🌟\n\n"
                 "✨ <b>Available Services:</b>\n"
                 "1️⃣ <b>Get OTP:</b> 2 Credits per OTP\n"
-                "2️⃣ <b>Specific Number:</b> 10 Credits (Get 5 latest SMS)\n"
+                "2️⃣ <b>Specific Number:</b> 10 Credits (You will also get the last 5 messages of this number)\n"
                 "3️⃣ <b>Send Custom Message:</b> 1 Credit/Msg (Min 20)\n\n"
-                "💡 <i>Credits are deducted upfront. No refunds if numbers timeout without SMS.</i>\n\n"
+                "💡 <i>OTP credits are only deducted safely when a message successfully arrives!</i>\n\n"
                 f"💰 <b>Your Available Credit:</b> {rem}"
             )
             kb = InlineKeyboardMarkup([
@@ -434,7 +444,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "💰 Credit":
         resp, status = await verify_dekhohatke_license(license_data["key"], user.id)
         if resp.get("success"):
-            rem = resp.get("usage", {}).get("remaining", 0)
+            rem = get_remaining_credits(resp)
             await update.message.reply_text(f"💳 <b>Remaining Credit:</b> {rem}", parse_mode="HTML")
         else:
             await update.message.reply_text("❌ License expired or invalid. Please recharge from @dekhohatkebot.")
@@ -523,19 +533,13 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ License invalid. Please recharge from @dekhohatkebot.")
             return
             
-        rem = resp.get("usage", {}).get("remaining", 0)
-        if rem < 2 and not resp.get("license", {}).get("no_expiry"): # If it's a limit key and < 2
+        rem = get_remaining_credits(resp)
+        if rem < 2:
             await query.edit_message_text("❌ Insufficient Credit (Requires 2 Cr). Please recharge from @dekhohatkebot.")
             return
 
-        # Upfront Deduction
-        cons_resp, _ = await consume_dekhohatke_credit(key, user.id, 2)
-        if not cons_resp.get("success"):
-            await query.edit_message_text(f"❌ Deduction failed: {cons_resp.get('message')}")
-            return
-            
+        # Deferred Deduction strategy: Only deduct credit once OTP arrives
         await query.edit_message_text("Searching active databases... ⏳")
-        await log_public_history(user.id, "GET_OTP_DEDUCTION", "Deducted 2 Credits")
 
         fetch_tasks = [fetch_json(f"{fb_url}/clients") for fb_url in FIREBASE_URLS]
         results = await asyncio.gather(*fetch_tasks)
@@ -550,7 +554,7 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if num: all_active.append({'fb_url': fb_url, 'dev_id': dev_id, 'num': num, 'ts': get_latest_timestamp(client)})
         
         if not all_active:
-            await query.edit_message_text("❌ No active numbers found right now. (Credits deducted but you can request another immediately).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="pub_cancel")]]))
+            await query.edit_message_text("❌ No active numbers found right now.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="pub_cancel")]]))
             return
 
         selected = random.choice(all_active[:5])
@@ -560,19 +564,22 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ <b>Number Found:</b> <code>{num}</code>\n"
             f"Status: <b>Valid for 5 Minutes</b> ⏱️\n"
+            f"<i>*Note: 2 Credits will be deducted automatically when the first SMS arrives.</i>\n\n"
             f"Send your SMS. New messages will appear here.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
         )
         
         session_id = int(time.time() * 1000)
-        task = asyncio.create_task(monitor_pub_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], num, 300, session_id))
+        task = asyncio.create_task(monitor_pub_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], num, 300, session_id, key))
         active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
 
-async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs, session_id):
+async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs, session_id, license_key):
     end_time = time.time() + duration_secs
     initial_raw = await fetch_json(f"{fb_url}/messages/{dev_id}")
     for k, m in parse_messages(initial_raw):
         is_duplicate_sms(fb_url, dev_id, k, m, record_only=True)
+
+    deducted = False
 
     try:
         while time.time() < end_time:
@@ -581,6 +588,16 @@ async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_numb
             fresh_raw = await fetch_json(f"{fb_url}/messages/{dev_id}")
             for k, m in parse_messages(fresh_raw):
                 if is_incoming_sms(m) and not is_duplicate_sms(fb_url, dev_id, k, m, record_only=False):
+                    
+                    if not deducted:
+                        cons_resp, _ = await consume_dekhohatke_credit(license_key, user_id, 2, request_id=f"otp_{session_id}")
+                        if not cons_resp.get("success"):
+                            await context.bot.send_message(chat_id=chat_id, text="❌ SMS arrived, but you have insufficient credits to view it. Please recharge.")
+                            active_otp_sessions.pop(user_id, None)
+                            return
+                        deducted = True
+                        await log_public_history(user_id, "GET_OTP_DEDUCTION", f"Deducted 2 Credits for {mobile_number}")
+                    
                     sender = html.escape(str(m.get('sender', 'Unknown')))
                     text = html.escape(str(m.get('message', '')))
                     dt = html.escape(str(m.get('dateTime', 'Just Now')))
@@ -600,7 +617,10 @@ async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_numb
         curr = active_otp_sessions.get(user_id)
         if curr and curr.get("session_id") == session_id:
             active_otp_sessions.pop(user_id, None)
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired.", parse_mode="HTML")
+            if deducted:
+                await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired.", parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired. No SMS arrived, so <b>no credits were deducted</b>.", parse_mode="HTML")
     except asyncio.CancelledError: pass
 
 async def pub_ask_specific_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -621,7 +641,9 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
     license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
     key = license_data.get("key")
     resp, _ = await verify_dekhohatke_license(key, user.id)
-    if not resp.get("success") or resp.get("usage", {}).get("remaining", 0) < 10:
+    rem = get_remaining_credits(resp)
+    
+    if not resp.get("success") or rem < 10:
         await update.message.reply_text("❌ Insufficient Credit (Requires 10 Cr). Recharge from @dekhohatkebot.")
         return ConversationHandler.END
 
@@ -641,8 +663,8 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
         await status_msg.edit_text("❌ Number not available in db.")
         return ConversationHandler.END
 
-    # Deduct 10
-    cons_resp, _ = await consume_dekhohatke_credit(key, user.id, 10)
+    # Deduct 10 instantly for specific number since history is fetched immediately
+    cons_resp, _ = await consume_dekhohatke_credit(key, user.id, 10, request_id=f"spec_{int(time.time())}")
     if not cons_resp.get("success"):
         await status_msg.edit_text(f"❌ Deduction failed: {cons_resp.get('message')}")
         return ConversationHandler.END
@@ -669,7 +691,11 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
 
     cancel_user_otp_task(user.id)
     session_id = int(time.time() * 1000)
-    task = asyncio.create_task(monitor_pub_otp(context, user.id, update.message.chat_id, fb_url, dev_id, target_num, 300, session_id))
+    
+    # Send a dummy key because it won't consume anymore in monitor_pub_otp for this flow
+    task = asyncio.create_task(monitor_pub_otp(context, user.id, update.message.chat_id, fb_url, dev_id, target_num, 300, session_id, key))
+    
+    # Immediately flag as deducted so monitor_pub_otp doesn't charge again for specific numbers
     active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
     return ConversationHandler.END
 
@@ -708,11 +734,13 @@ async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE
     license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
     key = license_data.get("key")
     resp, _ = await verify_dekhohatke_license(key, user.id)
-    if not resp.get("success") or resp.get("usage", {}).get("remaining", 0) < qty:
+    rem = get_remaining_credits(resp)
+    
+    if not resp.get("success") or rem < qty:
         await update.message.reply_text(f"❌ Insufficient Credit (Requires {qty} Cr). Recharge from @dekhohatkebot.")
         return ConversationHandler.END
 
-    cons_resp, _ = await consume_dekhohatke_credit(key, user.id, qty)
+    cons_resp, _ = await consume_dekhohatke_credit(key, user.id, qty, request_id=f"send_{int(time.time())}")
     if not cons_resp.get("success"):
         await update.message.reply_text(f"❌ Deduction failed: {cons_resp.get('message')}")
         return ConversationHandler.END
