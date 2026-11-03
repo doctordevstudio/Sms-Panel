@@ -405,6 +405,7 @@ async def show_public_welcome(update, context, edit=False):
                 [InlineKeyboardButton("📩 Get OTP (2 Cr)", callback_data="pub_get_otp")],
                 [InlineKeyboardButton("🎯 Specific No. (10 Cr)", callback_data="pub_get_specific_no")],
                 [InlineKeyboardButton("📤 Send Message", callback_data="pub_send_msg")],
+                [InlineKeyboardButton("🎁 Free Trial (Custom SMS)", callback_data="pub_free_trial")],
                 [InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]
             ])
 
