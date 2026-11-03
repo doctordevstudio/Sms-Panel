@@ -22,7 +22,7 @@ from telegram.ext import (
 
 # --- Configuration & Environment Variables ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", 0))
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID") or 0)
 
 MY_DB_URL = os.environ.get("MY_DB_URL", "").strip().rstrip('/')
 
@@ -296,23 +296,32 @@ def cancel_user_send_task(user_id):
 
 async def notify_admin(context, message):
     if ADMIN_CHAT_ID:
-        try: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"🛡️ <b>[ADMIN NOTIFY]</b>
-{message}", parse_mode="HTML")
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"🛡️ <b>[ADMIN NOTIFY]</b>\n{message}",
+                parse_mode="HTML",
+            )
         except: pass
 
 async def notify_admin_user_start(context, user):
     if not is_admin(user.id) and ADMIN_CHAT_ID:
-        profile_text = f"🆕 <b>User Started Bot</b>
-
-<b>Name:</b> {html.escape(user.full_name)}
-<b>Username:</b> @{user.username}
-<b>ID:</b> <code>{user.id}</code>"
+        profile_text = (
+            f"🆕 <b>User Started Bot</b>\n\n"
+            f"<b>Name:</b> {html.escape(user.full_name)}\n"
+            f"<b>Username:</b> @{user.username}\n"
+            f"<b>ID:</b> <code>{user.id}</code>"
+        )
         try:
             photos = await context.bot.get_user_profile_photos(user.id)
             if photos.total_count > 0:
                 photo_id = photos.photos[0][-1].file_id
-                await context.bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=photo_id, caption=f"🛡️ <b>[ADMIN NOTIFY]</b>
-{profile_text}", parse_mode="HTML")
+                await context.bot.send_photo(
+                    chat_id=ADMIN_CHAT_ID,
+                    photo=photo_id,
+                    caption=f"🛡️ <b>[ADMIN NOTIFY]</b>\n{profile_text}",
+                    parse_mode="HTML",
+                )
             else:
                 await notify_admin(context, profile_text)
         except:
@@ -341,8 +350,10 @@ async def show_projects_menu(update, context):
     if is_admin(user.id):
         kb.append([InlineKeyboardButton("➕ Create Project", callback_data="create_project")])
     elif not projects:
-        text = "No projects available right now.
-<b>Please wait for the Admin to create one.</b>"
+        text = (
+            "No projects available right now.\n"
+            "<b>Please wait for the Admin to create one.</b>"
+        )
         if update.callback_query: await update.callback_query.edit_message_text(text, parse_mode="HTML")
         else: await update.message.reply_text(text, parse_mode="HTML")
         return
@@ -370,27 +381,18 @@ async def check_joined_channel(user_id, context):
 async def show_public_welcome(update, context, edit=False):
     user = update.effective_user
     license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
-    
+
     if license_data and license_data.get("key"):
         resp, status = await verify_dekhohatke_license(license_data["key"], user.id)
         if resp.get("success"):
             rem = get_remaining_credits(resp)
             text = (
-                "🌟 <b>Welcome to SMS Service!</b> 🌟
-
-"
-                "✨ <b>Available Services:</b>
-"
-                "1️⃣ <b>Get OTP:</b> 2 Credits per OTP
-"
-                "2️⃣ <b>Specific Number:</b> 10 Credits (You will also get the last 5 messages of this number)
-"
-                "3️⃣ <b>Send Custom Message:</b> 1 Credit/Msg (Min 20)
-
-"
-                "💡 <i>OTP credits are only deducted safely when a message successfully arrives!</i>
-
-"
+                "🌟 <b>Welcome to SMS Service!</b> 🌟\n\n"
+                "✨ <b>Available Services:</b>\n"
+                "1️⃣ <b>Get OTP:</b> 2 Credits per OTP\n"
+                "2️⃣ <b>Specific Number:</b> 10 Credits (You will also get the last 5 messages of this number)\n"
+                "3️⃣ <b>Send Custom Message:</b> 1 Credit/Msg (Min 20)\n\n"
+                "💡 <i>OTP credits are only deducted safely when a message successfully arrives!</i>\n\n"
                 f"💰 <b>Your Available Credit:</b> {rem}"
             )
             kb = InlineKeyboardMarkup([
@@ -398,22 +400,18 @@ async def show_public_welcome(update, context, edit=False):
                 [InlineKeyboardButton("🎯 Specific No. (10 Cr)", callback_data="pub_get_specific_no")],
                 [InlineKeyboardButton("📤 Send Message", callback_data="pub_send_msg")]
             ])
-            
+
             if not edit and update.message:
                 await update.message.reply_text("✅ Menu Loaded", reply_markup=get_reply_keyboard())
-            
+
             if edit: await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
             else: await context.bot.send_message(user.id, text, reply_markup=kb, parse_mode="HTML")
             return
-    
+
     text = (
-        "🌟 <b>Welcome to SMS Service!</b> 🌟
-
-"
+        "🌟 <b>Welcome to SMS Service!</b> 🌟\n\n"
         "To access our premium features (OTP, Specific Number tracking, Custom SMS sender), "
-        "you need a valid License Key.
-
-"
+        "you need a valid License Key.\n\n"
         "🛒 <i>Purchase your key from @dekhohatkebot</i>"
     )
     kb = InlineKeyboardMarkup([
@@ -432,15 +430,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admin_user_start(context, user)
         context.user_data["has_started"] = True
         await log_action_to_firebase(user.id, user.first_name, "STARTED_BOT")
-        
+
     if is_authorized(user.id):
         await show_projects_menu(update, context)
     else:
         if not await check_joined_channel(user.id, context):
             kb = [[InlineKeyboardButton("📢 Join Channel", url="https://t.me/SMSPANNELS")],
                   [InlineKeyboardButton("✅ Verify", callback_data="verify_join")]]
-            await update.message.reply_text("👋 <b>Welcome!</b>
-Please join our official channel to continue.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            await update.message.reply_text(
+                "👋 <b>Welcome!</b>\nPlease join our official channel to continue.",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode="HTML",
+            )
             return
         await show_public_welcome(update, context)
 
@@ -462,7 +463,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if text == "🏠 Home":
         await show_public_welcome(update, context)
-    
+
     elif text == "💰 Credit":
         resp, status = await verify_dekhohatke_license(license_data["key"], user.id)
         if resp.get("success"):
@@ -470,7 +471,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"💳 <b>Remaining Credit:</b> {rem}", parse_mode="HTML")
         else:
             await update.message.reply_text("❌ License expired or invalid. Please recharge from @dekhohatkebot.")
-    
+
     elif text == "📜 History":
         history = await fetch_json(f"{MY_DB_URL}/users_history/{user.id}") or {}
         if not history:
@@ -480,7 +481,7 @@ async def public_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         sorted_hist = sorted(history.items(), key=lambda x: int(x[0]), reverse=True)
         context.user_data['full_history'] = sorted_hist
         await show_history_page(update, context, 0)
-    
+
     elif text == "🎧 Customer Support":
         await update.message.reply_text("👨‍💻 For support, please contact: <b>@dekhohatkebot</b>", parse_mode="HTML")
 
@@ -488,26 +489,24 @@ async def show_history_page(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     full_hist = context.user_data.get('full_history', [])
     total_pages = max(1, (len(full_hist) + 4) // 5)
     page = max(0, min(page, total_pages - 1))
-    
-    items = full_hist[page*5 : (page+1)*5]
-    text = f"📜 <b>Your History (Page {page+1}/{total_pages})</b>
 
-"
+    items = full_hist[page*5 : (page+1)*5]
+    text = f"📜 <b>Your History (Page {page+1}/{total_pages})</b>\n\n"
     for _, item in items:
         dt = item.get('date_time', '')
         act = item.get('action', '')
         det = item.get('details', '')
-        text += f"▪️ <b>{dt}</b>
-<b>{act}</b>: <code>{html.escape(det)}</code>
+        text += (
+            f"▪️ <b>{dt}</b>\n"
+            f"<b>{act}</b>: <code>{html.escape(det)}</code>\n\n"
+        )
 
-"
-        
     kb = []
     nav = []
     if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"hist_page_{page-1}"))
     if page < total_pages - 1: nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"hist_page_{page+1}"))
     if nav: kb.append(nav)
-    
+
     if update.callback_query:
         await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb) if kb else None)
     else:
@@ -524,10 +523,10 @@ async def pub_verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE)
     key = update.message.text.strip()
     user = update.effective_user
     await update.message.delete()
-    
+
     status_msg = await update.message.reply_text("Verifying... ⏳")
     resp, code = await verify_dekhohatke_license(key, user.id)
-    
+
     if resp.get("success"):
         await put_json(f"{MY_DB_URL}/license_sms_service/{user.id}", {"key": key, "assigned_at": int(time.time()*1000)})
         await log_action_to_firebase(user.id, user.first_name, "LINKED_LICENSE", f"Key ending in {key[-4:]}")
@@ -536,8 +535,11 @@ async def pub_verify_license(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     else:
         msg = resp.get("message", "Invalid key.")
-        await status_msg.edit_text(f"❌ <b>Error:</b> {msg}
-Please try again or type /cancel.", parse_mode="HTML", reply_markup=get_pub_cancel_keyboard())
+        await status_msg.edit_text(
+            f"❌ <b>Error:</b> {msg}\nPlease try again or type /cancel.",
+            parse_mode="HTML",
+            reply_markup=get_pub_cancel_keyboard(),
+        )
         return PUB_ASK_LICENSE
 
 # --- Public Actions ---
@@ -545,22 +547,22 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new
     query = update.callback_query
     user = query.from_user
     await query.answer()
-    
+
     lock = user_action_locks.setdefault(user.id, asyncio.Lock())
     if lock.locked(): return
-    
+
     async with lock:
         cancel_user_otp_task(user.id)
-        
+
         # Verify License & Balance
         license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
         key = license_data.get("key")
         resp, _ = await verify_dekhohatke_license(key, user.id)
-        
+
         if not resp.get("success"):
             await query.edit_message_text("❌ License invalid. Please recharge from @dekhohatkebot.")
             return
-            
+
         rem = get_remaining_credits(resp)
         if rem < 2:
             await query.edit_message_text("❌ Insufficient Credit (Requires 2 Cr). Please recharge from @dekhohatkebot.")
@@ -580,7 +582,7 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new
                 if get_latest_timestamp(client) >= now_ms - (10 * 60 * 1000):
                     num = extract_client_number(client)
                     if num: all_active.append({'fb_url': fb_url, 'dev_id': dev_id, 'num': num, 'ts': get_latest_timestamp(client)})
-        
+
         if not all_active:
             await query.edit_message_text("❌ No active numbers found right now.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back", callback_data="pub_cancel")]]))
             return
@@ -601,23 +603,19 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new
 
         context.user_data.setdefault('pub_used_numbers', set()).add(selected['num'])
         num = selected['num']
-        
+
         kb = [
             [InlineKeyboardButton("Get New Number 🔄", callback_data="pub_get_new_number")],
             [InlineKeyboardButton("Cancel ❌", callback_data="pub_cancel")]
         ]
         await query.edit_message_text(
-            f"✅ <b>Number Found:</b> <code>{num}</code>
-"
-            f"Status: <b>Valid for 5 Minutes</b> ⏱️
-"
-            f"<i>*Note: 2 Credits will be deducted automatically when the first SMS arrives.</i>
-
-"
+            f"✅ <b>Number Found:</b> <code>{num}</code>\n"
+            f"Status: <b>Valid for 5 Minutes</b> ⏱️\n"
+            f"<i>*Note: 2 Credits will be deducted automatically when the first SMS arrives.</i>\n\n"
             f"Send your SMS. New messages will appear here.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
         )
-        
+
         session_id = int(time.time() * 1000)
         task = asyncio.create_task(monitor_pub_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], num, 300, session_id, key))
         active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
@@ -637,7 +635,7 @@ async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_numb
             fresh_raw = await fetch_json(f"{fb_url}/messages/{dev_id}")
             for k, m in parse_messages(fresh_raw):
                 if is_incoming_sms(m) and not is_duplicate_sms(fb_url, dev_id, k, m, record_only=False):
-                    
+
                     if not deducted:
                         cons_resp, _ = await consume_dekhohatke_credit(license_key, user_id, 2, request_id=f"otp_{session_id}")
                         if not cons_resp.get("success"):
@@ -646,37 +644,39 @@ async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_numb
                             return
                         deducted = True
                         await log_public_history(user_id, "GET_OTP_DEDUCTION", f"Deducted 2 Credits for {mobile_number}")
-                    
+
                     sender = html.escape(str(m.get('sender', 'Unknown')))
                     text = html.escape(str(m.get('message', '')))
                     dt = html.escape(str(m.get('dateTime', 'Just Now')))
                     alert = (
-                        f"🔔 <b>NEW MESSAGE</b> 🔔
-
-"
-                        f"<b>To:</b> <code>{mobile_number}</code>
-"
-                        f"<b>From:</b> {sender}
-"
-                        f"<b>Time:</b> {dt}
-
-"
-                        f"<b>Message:</b>
-<code>{text}</code>"
+                        f"🔔 <b>NEW MESSAGE</b> 🔔\n\n"
+                        f"<b>To:</b> <code>{mobile_number}</code>\n"
+                        f"<b>From:</b> {sender}\n"
+                        f"<b>Time:</b> {dt}\n\n"
+                        f"<b>Message:</b>\n<code>{text}</code>"
                     )
                     try:
                         await context.bot.send_message(chat_id=chat_id, text=alert, parse_mode="HTML")
                         await log_public_history(user_id, "RECEIVED_SMS", f"To {mobile_number} from {sender}")
                     except: pass
             await asyncio.sleep(2.5)
-            
+
         curr = active_otp_sessions.get(user_id)
         if curr and curr.get("session_id") == session_id:
             active_otp_sessions.pop(user_id, None)
             if deducted:
-                await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired.", parse_mode="HTML")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired.",
+                    parse_mode="HTML",
+                )
             else:
-                await context.bot.send_message(chat_id=chat_id, text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired. No SMS arrived, so <b>no credits were deducted</b>.", parse_mode="HTML")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired. "
+                         f"No SMS arrived, so <b>no credits were deducted</b>.",
+                    parse_mode="HTML",
+                )
     except asyncio.CancelledError: pass
 
 async def pub_ask_specific_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,7 +689,7 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
     user = update.effective_user
     target_num = clean_mobile_number(update.message.text.strip())
     await update.message.delete()
-    
+
     if not target_num:
         await update.message.reply_text("❌ Invalid format.", reply_markup=get_pub_cancel_keyboard())
         return PUB_ASK_SPECIFIC
@@ -698,14 +698,14 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
     key = license_data.get("key")
     resp, _ = await verify_dekhohatke_license(key, user.id)
     rem = get_remaining_credits(resp)
-    
+
     if not resp.get("success") or rem < 10:
         await update.message.reply_text("❌ Insufficient Credit (Requires 10 Cr). Recharge from @dekhohatkebot.")
         return ConversationHandler.END
 
     status_msg = await update.message.reply_text("Searching databases... ⏳")
     results = await asyncio.gather(*[fetch_json(f"{f}/clients") for f in FIREBASE_URLS])
-    
+
     match = None
     for f_url, c_data in zip(FIREBASE_URLS, results):
         if not c_data or not isinstance(c_data, dict): continue
@@ -729,7 +729,7 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
     fb_url, dev_id = match
     raw_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}")
     parsed_msgs = sorted(parse_messages(raw_msgs), key=lambda x: int(x[1].get('id', x[0])) if str(x[1].get('id', x[0])).isdigit() else 0)
-    
+
     unique_history = []
     seen = set()
     for _, m in parsed_msgs:
@@ -738,23 +738,23 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
             if sig not in seen:
                 seen.add(sig); unique_history.append(m)
 
-    msg_history = f"✅ <b>Tracking:</b> <code>{target_num}</code>
-
-"
+    msg_history = f"✅ <b>Tracking:</b> <code>{target_num}</code>\n\n"
     for m in unique_history[-5:]:
-        msg_history += f"[{html.escape(str(m.get('dateTime', '')))}] <b>{html.escape(str(m.get('sender', '')))}:</b> <code>{html.escape(str(m.get('message', '')))}</code>
+        msg_history += (
+            f"[{html.escape(str(m.get('dateTime', '')))}] "
+            f"<b>{html.escape(str(m.get('sender', '')))}:</b> "
+            f"<code>{html.escape(str(m.get('message', '')))}</code>\n\n"
+        )
 
-"
-    
     kb = [[InlineKeyboardButton("Cancel Listening ❌", callback_data="pub_cancel")]]
     await status_msg.edit_text(msg_history[:4000], parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
     cancel_user_otp_task(user.id)
     session_id = int(time.time() * 1000)
-    
+
     # Send a dummy key because it won't consume anymore in monitor_pub_otp for this flow
     task = asyncio.create_task(monitor_pub_otp(context, user.id, update.message.chat_id, fb_url, dev_id, target_num, 300, session_id, key))
-    
+
     # Immediately flag as deducted so monitor_pub_otp doesn't charge again for specific numbers
     active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
     return ConversationHandler.END
@@ -762,10 +762,10 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
 async def pub_start_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     is_free = (query.data == "pub_free_trial")
     context.user_data['is_free_trial'] = is_free
-    
+
     if is_free:
         user = query.from_user
         trials = await fetch_json(f"{MY_DB_URL}/free_trials/{user.id}") or {}
@@ -773,7 +773,7 @@ async def pub_start_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if count >= 3:
             await query.edit_message_text("❌ You have exhausted your 3 free trials.\nPlease purchase a license key.", reply_markup=get_pub_cancel_keyboard())
             return ConversationHandler.END
-        
+
     await query.edit_message_text("Enter <b>Target Mobile Number</b>:", parse_mode="HTML", reply_markup=get_pub_cancel_keyboard())
     return PUB_ASK_SEND_TARGET
 
@@ -786,19 +786,19 @@ async def pub_ask_msg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pub_ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['custom_message'] = update.message.text.strip()
     await update.message.delete()
-    
+
     is_free = context.user_data.get('is_free_trial', False)
     if is_free:
         await update.message.reply_text("Enter <b>Total Quantity</b> (Maximum 20 for Free Trial):", parse_mode="HTML", reply_markup=get_pub_cancel_keyboard())
     else:
         await update.message.reply_text("Enter <b>Total Quantity</b> (Minimum 20):", parse_mode="HTML", reply_markup=get_pub_cancel_keyboard())
-    
+
     return PUB_ASK_SEND_QTY
 
 async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_free = context.user_data.get('is_free_trial', False)
-    
+
     try:
         qty = int(update.message.text.strip())
         if is_free and (qty <= 0 or qty > 20):
@@ -813,7 +813,7 @@ async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.delete()
         await update.message.reply_text("❌ Invalid quantity.", reply_markup=get_pub_cancel_keyboard())
         return PUB_ASK_SEND_QTY
-    
+
     await update.message.delete()
     target = context.user_data['target_number']
     msg = context.user_data['custom_message']
@@ -828,7 +828,7 @@ async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE
         key = license_data.get("key")
         resp, _ = await verify_dekhohatke_license(key, user.id)
         rem = get_remaining_credits(resp)
-        
+
         if not resp.get("success") or rem < qty:
             await update.message.reply_text(f"❌ Insufficient Credit (Requires {qty} Cr). Recharge from @dekhohatkebot.")
             return ConversationHandler.END
@@ -883,18 +883,27 @@ async def run_pub_batch_send(context, user, target_number, msg_text, quantity, s
             else: failed += 1
             if i % 3 == 0 or i == quantity:
                 fill = int(15 * i / quantity)
-                try: await status_msg.edit_text(f"🚀 <b>Sending...</b>
-[{'█'*fill}{'░'*(15-fill)}] {i}/{quantity}
-Success: {success} | Failed: {failed}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+                try:
+                    await status_msg.edit_text(
+                        f"🚀 <b>Sending...</b>\n"
+                        f"[{'█'*fill}{'░'*(15-fill)}] {i}/{quantity}\n"
+                        f"Success: {success} | Failed: {failed}",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
                 except: pass
             await asyncio.sleep(0.5)
-        report = f"✅ <b>Batch Finished</b>
-Target: <code>{target_number}</code>
-Success: {success} | Failed: {failed}"
+        report = (
+            f"✅ <b>Batch Finished</b>\n"
+            f"Target: <code>{target_number}</code>\n"
+            f"Success: {success} | Failed: {failed}"
+        )
         await status_msg.edit_text(report, parse_mode="HTML")
     except asyncio.CancelledError:
-        await status_msg.edit_text(f"🛑 <b>Stopped Early</b>
-Success: {success}", parse_mode="HTML")
+        await status_msg.edit_text(
+            f"🛑 <b>Stopped Early</b>\nSuccess: {success}",
+            parse_mode="HTML",
+        )
     finally:
         active_send_tasks.pop(user.id, None)
 
@@ -939,25 +948,15 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     help_text = (
-        "🛠️ <b>Admin Commands Panel</b>
-
-"
-        "<code>/start</code> - Start Bot & Show Projects
-"
-        "<code>/help</code> - Show this menu
-"
-        "<code>/track &lt;project&gt;</code> - View all login/fail marks for a project
-"
-        "<code>/editmark &lt;project&gt; &lt;number&gt; &lt;login|fail|clear&gt;</code> - Modify or remove a number mark
-"
-        "<code>/block &lt;chat_id&gt;</code> - Block a user
-"
-        "<code>/release &lt;chat_id&gt;</code> - Unblock a user
-"
-        "<code>/cancelsend &lt;chat_id&gt;</code> - Stop user's message sending
-"
-        "<code>/send &lt;chat_id&gt;</code> - Forward a custom message to user
-"
+        "🛠️ <b>Admin Commands Panel</b>\n\n"
+        "<code>/start</code> - Start Bot & Show Projects\n"
+        "<code>/help</code> - Show this menu\n"
+        "<code>/track &lt;project&gt;</code> - View all login/fail marks for a project\n"
+        "<code>/editmark &lt;project&gt; &lt;number&gt; &lt;login|fail|clear&gt;</code> - Modify or remove a number mark\n"
+        "<code>/block &lt;chat_id&gt;</code> - Block a user\n"
+        "<code>/release &lt;chat_id&gt;</code> - Unblock a user\n"
+        "<code>/cancelsend &lt;chat_id&gt;</code> - Stop user's message sending\n"
+        "<code>/send &lt;chat_id&gt;</code> - Forward a custom message to user\n"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
@@ -971,16 +970,13 @@ async def cmd_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not marks:
         await update.message.reply_text(f"No records found for project: <b>{proj}</b>", parse_mode="HTML")
         return
-    lines = [f"📊 <b>Stats for {proj}</b>
-"]
+    lines = [f"📊 <b>Stats for {proj}</b>\n"]
     for num, data in marks.items():
         st = data.get('status', 'Unknown').upper()
         by = data.get('marked_by_name', 'Unknown')
         lines.append(f"• <code>{num}</code> - {st} (by {by})")
-    text = "
-".join(lines)
-    if len(text) > 4000: text = text[:4000] + "
-...truncated"
+    text = "\n".join(lines)
+    if len(text) > 4000: text = text[:4000] + "\n...truncated"
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_editmark(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1087,9 +1083,9 @@ async def handle_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_
             [InlineKeyboardButton("Cancel Number ❌", callback_data="cancel_number")]
         ]
         await show_status(
-            f"✅ <b>Number Found:</b> <code>{num}</code>
-📁 <b>Project:</b> {proj}
-Status: <b>Valid for 5 Minutes</b> ⏱️",
+            f"✅ <b>Number Found:</b> <code>{num}</code>\n"
+            f"📁 <b>Project:</b> {proj}\n"
+            f"Status: <b>Valid for 5 Minutes</b> ⏱️",
             kb=InlineKeyboardMarkup(kb)
         )
         session_id = int(time.time() * 1000)
@@ -1111,22 +1107,26 @@ async def monitor_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, 
                     sender = html.escape(str(m.get('sender', 'Unknown')))
                     text = html.escape(str(m.get('message', '')))
                     dt = html.escape(str(m.get('dateTime', 'Just Now')))
-                    alert = (f"🔔 <b>NEW MESSAGE</b> 🔔
-
-<b>Project:</b> {proj}
-<b>To:</b> <code>{mobile_number}</code>
-<b>From:</b> {sender}
-<b>Time:</b> {dt}
-
-<b>Message:</b>
-<code>{text}</code>")
+                    alert = (
+                        f"🔔 <b>NEW MESSAGE</b> 🔔\n\n"
+                        f"<b>Project:</b> {proj}\n"
+                        f"<b>To:</b> <code>{mobile_number}</code>\n"
+                        f"<b>From:</b> {sender}\n"
+                        f"<b>Time:</b> {dt}\n\n"
+                        f"<b>Message:</b>\n<code>{text}</code>"
+                    )
                     try: await context.bot.send_message(chat_id=chat_id, text=alert, parse_mode="HTML")
                     except: pass
             await asyncio.sleep(2.5)
         curr = active_otp_sessions.get(user_id)
         if curr and curr.get("session_id") == session_id:
             active_otp_sessions.pop(user_id, None)
-            await context.bot.send_message(chat_id=chat_id, text=f"⏰ Window for <code>{mobile_number}</code> expired.", parse_mode="HTML", reply_markup=get_main_menu(proj))
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏰ Window for <code>{mobile_number}</code> expired.",
+                parse_mode="HTML",
+                reply_markup=get_main_menu(proj),
+            )
     except asyncio.CancelledError: pass
 
 async def handle_user_mark(update: Update, context: ContextTypes.DEFAULT_TYPE, status: str):
@@ -1155,10 +1155,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Allow verify_join for all
     if data == "verify_join":
         if await check_joined_channel(user.id, context): await show_public_welcome(update, context, edit=True)
-        else: await query.edit_message_text("❌ You have not joined the channel yet.
-Please join and try again.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 Join", url="https://t.me/SMSPANNELS"), InlineKeyboardButton("✅ Verify", callback_data="verify_join")]]))
+        else:
+            await query.edit_message_text(
+                "❌ You have not joined the channel yet.\nPlease join and try again.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📢 Join", url="https://t.me/SMSPANNELS"),
+                    InlineKeyboardButton("✅ Verify", callback_data="verify_join"),
+                ]]),
+            )
         return
-        
+
     # Block unauthorized access paths unless it's public features
     if not is_authorized(user.id) and not data.startswith("pub_") and data not in ["enter_license"]:
         return
@@ -1167,13 +1173,16 @@ Please join and try again.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardB
     if data == "pub_get_otp": await pub_get_otp(update, context, False)
     elif data == "pub_get_new_number": await pub_get_otp(update, context, True)
     elif data == "pub_cancel": await pub_cancel_handler(update, context)
-    
+
     # Authorized routes
     elif data.startswith("prj_"):
         p_name = data[4:]
         context.user_data['current_project'] = p_name
-        await query.edit_message_text(f"📁 <b>Project Active:</b> {p_name}
-Select an action:", parse_mode="HTML", reply_markup=get_main_menu(p_name))
+        await query.edit_message_text(
+            f"📁 <b>Project Active:</b> {p_name}\nSelect an action:",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(p_name),
+        )
     elif data == "back_to_projects":
         context.user_data.pop('current_project', None)
         await show_projects_menu(update, context)
@@ -1205,7 +1214,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.Regex('^(🏠 Home|💰 Credit|📜 History|🎧 Customer Support)$'), public_menu_handler))
-    
+
     # Pagination History Callback
     app.add_handler(CallbackQueryHandler(lambda u, c: asyncio.create_task(show_history_page(u, c, int(u.callback_query.data.split('_')[2]))), pattern="^hist_page_"))
 
