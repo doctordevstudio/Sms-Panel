@@ -578,25 +578,28 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new
     async with lock:
         cancel_user_otp_task(user.id)
 
-        # Verify License & Balance
-        license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
-        key = license_data.get("key")
-        resp, _ = await verify_dekhohatke_license(key, user.id)
+        # Admins/access users bypass license & credit checks entirely
+        bypass_credit = is_authorized(user.id)
+        key = None
+        if not bypass_credit:
+            license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
+            key = (license_data or {}).get("key")
+            resp, _ = await verify_dekhohatke_license(key, user.id)
 
-        if not resp.get("success"):
-            await query.edit_message_text(
-                "❌ License invalid. Please recharge from @dekhohatkebot.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
-            )
-            return
+            if not resp.get("success"):
+                await query.edit_message_text(
+                    "❌ License invalid. Please recharge from @dekhohatkebot.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
+                )
+                return
 
-        rem = get_remaining_credits(resp)
-        if rem < 2:
-            await query.edit_message_text(
-                "❌ Insufficient Credit (Requires 2 Cr). Please recharge from @dekhohatkebot.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
-            )
-            return
+            rem = get_remaining_credits(resp)
+            if rem < 2:
+                await query.edit_message_text(
+                    "❌ Insufficient Credit (Requires 2 Cr). Please recharge from @dekhohatkebot.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
+                )
+                return
 
         # Deferred Deduction strategy: Only deduct credit once OTP arrives
         await query.edit_message_text("Searching active databases... ⏳")
@@ -645,25 +648,30 @@ async def pub_get_otp(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new
             [InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")],
             [InlineKeyboardButton("Cancel ❌", callback_data="pub_cancel")]
         ]
+        note = (
+            "<i>*Note: 2 Credits will be deducted automatically when the first SMS arrives.</i>\n\n"
+            if not bypass_credit else
+            "<i>*Admin/Access user: no credits will be deducted.</i>\n\n"
+        )
         await query.edit_message_text(
             f"✅ <b>Number Found:</b> <code>{num}</code>\n"
             f"Status: <b>Valid for 5 Minutes</b> ⏱️\n"
-            f"<i>*Note: 2 Credits will be deducted automatically when the first SMS arrives.</i>\n\n"
+            f"{note}"
             f"Send your SMS. New messages will appear here.",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb)
         )
 
         session_id = int(time.time() * 1000)
-        task = asyncio.create_task(monitor_pub_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], num, 300, session_id, key))
+        task = asyncio.create_task(monitor_pub_otp(context, user.id, query.message.chat_id, selected['fb_url'], selected['dev_id'], num, 300, session_id, key, bypass_credit))
         active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
 
-async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs, session_id, license_key):
+async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_number, duration_secs, session_id, license_key, bypass_credit=False):
     end_time = time.time() + duration_secs
     initial_raw = await fetch_json(f"{fb_url}/messages/{dev_id}")
     for k, m in parse_messages(initial_raw):
         is_duplicate_sms(fb_url, dev_id, k, m, record_only=True)
 
-    deducted = False
+    deducted = bypass_credit  # treat bypass as "already deducted" so we skip credit logic
 
     try:
         while time.time() < end_time:
@@ -701,7 +709,7 @@ async def monitor_pub_otp(context, user_id, chat_id, fb_url, dev_id, mobile_numb
         curr = active_otp_sessions.get(user_id)
         if curr and curr.get("session_id") == session_id:
             active_otp_sessions.pop(user_id, None)
-            if deducted:
+            if deducted and not bypass_credit:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"⏰ The 5-minute window for <code>{mobile_number}</code> has expired.",
@@ -731,17 +739,22 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("❌ Invalid format.", reply_markup=get_pub_cancel_keyboard())
         return PUB_ASK_SPECIFIC
 
-    license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
-    key = license_data.get("key")
-    resp, _ = await verify_dekhohatke_license(key, user.id)
-    rem = get_remaining_credits(resp)
+    # Admins/access users bypass license & credit checks entirely
+    bypass_credit = is_authorized(user.id)
+    key = None
 
-    if not resp.get("success") or rem < 10:
-        await update.message.reply_text(
-            "❌ Insufficient Credit (Requires 10 Cr). Recharge from @dekhohatkebot.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
-        )
-        return ConversationHandler.END
+    if not bypass_credit:
+        license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
+        key = (license_data or {}).get("key")
+        resp, _ = await verify_dekhohatke_license(key, user.id)
+        rem = get_remaining_credits(resp)
+
+        if not resp.get("success") or rem < 10:
+            await update.message.reply_text(
+                "❌ Insufficient Credit (Requires 10 Cr). Recharge from @dekhohatkebot.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
+            )
+            return ConversationHandler.END
 
     status_msg = await update.message.reply_text("Searching databases... ⏳")
     results = await asyncio.gather(*[fetch_json(f"{f}/clients") for f in FIREBASE_URLS])
@@ -762,16 +775,19 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
         )
         return ConversationHandler.END
 
-    # Deduct 10 instantly for specific number since history is fetched immediately
-    cons_resp, _ = await consume_dekhohatke_credit(key, user.id, 10, request_id=f"spec_{int(time.time())}")
-    if not cons_resp.get("success"):
-        await status_msg.edit_text(
-            f"❌ Deduction failed: {cons_resp.get('message')}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
-        )
-        return ConversationHandler.END
+    # Deduct 10 instantly for specific number (skipped for admins/access users)
+    if not bypass_credit:
+        cons_resp, _ = await consume_dekhohatke_credit(key, user.id, 10, request_id=f"spec_{int(time.time())}")
+        if not cons_resp.get("success"):
+            await status_msg.edit_text(
+                f"❌ Deduction failed: {cons_resp.get('message')}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="pub_go_home")]])
+            )
+            return ConversationHandler.END
+        await log_public_history(user.id, "SPECIFIC_NUMBER", f"Tracked {target_num} (-10 Cr)")
+    else:
+        await log_public_history(user.id, "SPECIFIC_NUMBER", f"Tracked {target_num} (Admin/Access - Free)")
 
-    await log_public_history(user.id, "SPECIFIC_NUMBER", f"Tracked {target_num} (-10 Cr)")
     fb_url, dev_id = match
     raw_msgs = await fetch_json(f"{fb_url}/messages/{dev_id}")
     parsed_msgs = sorted(parse_messages(raw_msgs), key=lambda x: int(x[1].get('id', x[0])) if str(x[1].get('id', x[0])).isdigit() else 0)
@@ -801,10 +817,9 @@ async def pub_process_specific_no(update: Update, context: ContextTypes.DEFAULT_
     cancel_user_otp_task(user.id)
     session_id = int(time.time() * 1000)
 
-    # Send a dummy key because it won't consume anymore in monitor_pub_otp for this flow
-    task = asyncio.create_task(monitor_pub_otp(context, user.id, update.message.chat_id, fb_url, dev_id, target_num, 300, session_id, key))
+    # Reuse monitor_pub_otp; bypass_credit=True means it will never try to charge
+    task = asyncio.create_task(monitor_pub_otp(context, user.id, update.message.chat_id, fb_url, dev_id, target_num, 300, session_id, key, bypass_credit))
 
-    # Immediately flag as deducted so monitor_pub_otp doesn't charge again for specific numbers
     active_otp_sessions[user.id] = {"task": task, "session_id": session_id}
     return ConversationHandler.END
 
@@ -814,6 +829,7 @@ async def pub_start_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     is_free = (query.data == "pub_free_trial")
     context.user_data['is_free_trial'] = is_free
+    context.user_data['is_admin_send'] = False
 
     if is_free:
         user = query.from_user
@@ -887,6 +903,8 @@ async def pub_ask_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     is_free = context.user_data.get('is_free_trial', False)
+    is_admin_send = context.user_data.get('is_admin_send', False)
+    bypass_credit = is_authorized(user.id) or is_admin_send
 
     try:
         qty = int(update.message.text.strip())
@@ -912,9 +930,12 @@ async def pub_process_sending(update: Update, context: ContextTypes.DEFAULT_TYPE
         count = trials.get("used", 0) + 1
         await put_json(f"{MY_DB_URL}/free_trials/{user.id}", {"used": count, "last_used": int(time.time()*1000)})
         await log_public_history(user.id, "FREE_TRIAL_SMS", f"Sent {qty} msgs to {target} (Trial {count}/3)")
+    elif bypass_credit:
+        # Admin / access user — no license, no deduction
+        await log_public_history(user.id, "CUSTOM_SMS", f"Sent {qty} msgs to {target} (Admin/Access - Free)")
     else:
         license_data = await fetch_json(f"{MY_DB_URL}/license_sms_service/{user.id}")
-        key = license_data.get("key")
+        key = (license_data or {}).get("key")
         resp, _ = await verify_dekhohatke_license(key, user.id)
         rem = get_remaining_credits(resp)
 
@@ -1263,6 +1284,35 @@ async def handle_user_mark(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     except: pass
     cancel_user_otp_task(user.id)
 
+# --- Admin specific-number and send-message entry points (route into public flows) ---
+async def admin_specific_no_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    # Admin/access users don't need license; just ask for the target number.
+    await query.edit_message_text(
+        "🎯 Enter the 10-digit mobile number:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Home", callback_data="go_home")],
+            [InlineKeyboardButton("Cancel ❌", callback_data="cancel_action")],
+        ])
+    )
+    return PUB_ASK_SPECIFIC
+
+async def admin_send_msg_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['is_free_trial'] = False
+    context.user_data['is_admin_send'] = True
+    await query.edit_message_text(
+        "Enter <b>Target Mobile Number</b>:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Home", callback_data="go_home")],
+            [InlineKeyboardButton("Cancel ❌", callback_data="cancel_action")],
+        ])
+    )
+    return PUB_ASK_SEND_TARGET
+
 # Router
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1290,6 +1340,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_projects_menu(update, context)
         else:
             await pub_go_home(update, context)
+        return
+
+    # Admin Home button (returns to current project menu or projects list)
+    if data == "go_home":
+        cancel_user_otp_task(user.id)
+        cancel_user_send_task(user.id)
+        proj = context.user_data.get('current_project')
+        if proj:
+            await query.edit_message_text(
+                f"📁 <b>Project Active:</b> {proj}\nSelect an action:",
+                parse_mode="HTML",
+                reply_markup=get_main_menu(proj),
+            )
+        else:
+            await show_projects_menu(update, context)
         return
 
     # Block unauthorized access paths unless it's public features
@@ -1354,23 +1419,35 @@ def main():
     app.add_handler(pub_license_conv)
 
     pub_spec_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(pub_ask_specific_no, pattern="^pub_get_specific_no$")],
+        entry_points=[
+            CallbackQueryHandler(pub_ask_specific_no, pattern="^pub_get_specific_no$"),
+            CallbackQueryHandler(admin_specific_no_entry, pattern="^get_specific_no$"),
+        ],
         states={PUB_ASK_SPECIFIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, pub_process_specific_no)]},
-        fallbacks=[CallbackQueryHandler(pub_cancel_handler, pattern="^pub_cancel$")]
+        fallbacks=[
+            CallbackQueryHandler(pub_cancel_handler, pattern="^pub_cancel$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel_action$"),
+            CallbackQueryHandler(callback_router, pattern="^go_home$"),
+        ]
     )
     app.add_handler(pub_spec_conv)
 
     pub_send_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(pub_start_send_msg, pattern="^pub_send_msg$"),
-            CallbackQueryHandler(pub_start_send_msg, pattern="^pub_free_trial$")
+            CallbackQueryHandler(pub_start_send_msg, pattern="^pub_free_trial$"),
+            CallbackQueryHandler(admin_send_msg_entry, pattern="^send_message$"),
         ],
         states={
             PUB_ASK_SEND_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, pub_ask_msg_text)],
             PUB_ASK_SEND_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, pub_ask_quantity)],
             PUB_ASK_SEND_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, pub_process_sending)]
         },
-        fallbacks=[CallbackQueryHandler(pub_cancel_handler, pattern="^pub_cancel$")]
+        fallbacks=[
+            CallbackQueryHandler(pub_cancel_handler, pattern="^pub_cancel$"),
+            CallbackQueryHandler(cancel_handler, pattern="^cancel_action$"),
+            CallbackQueryHandler(callback_router, pattern="^go_home$"),
+        ]
     )
     app.add_handler(pub_send_conv)
 
